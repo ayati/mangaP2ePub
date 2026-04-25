@@ -631,7 +631,8 @@ def normalize_to_viewport(img_bytes: bytes,
                           target_w: int = VIEWPORT_W,
                           target_h: int = VIEWPORT_H,
                           quality: int = JPEG_QUALITY,
-                          crop_box: Optional[tuple[float, float, float, float]] = None) -> bytes:
+                          crop_box: Optional[tuple[float, float, float, float]] = None,
+                          crop_stats: Optional[dict] = None) -> bytes:
     """Fit-resize into target_w x target_h, letterboxing with white.
 
     RGB images that are essentially monochrome (B&W manga interiors, even
@@ -641,11 +642,38 @@ def normalize_to_viewport(img_bytes: bytes,
     crop_box: optional (T, B, L, R) fractional margins (0..1) to strip from
     each side before fitting. Applied per-page using the page's own
     dimensions, so the same fractions work for PDFs with mixed page sizes.
+
+    Per-page guard: a page is cropped only when (a) it is effectively
+    monochrome (color illustrations stay full-frame) and (b) at most ONE
+    of its four margins is below CROP_MIN_MARGIN_FRAC. A single tight side
+    on an otherwise normal text page is usually a page-number/edge artifact
+    and is fine to crop; two or more tight sides indicates a full-bleed
+    B&W illustration that should stay full-frame. This preserves covers,
+    frontispieces, and in-body illustrations while uniformly cropping the
+    body text pages.
     """
     im = Image.open(BytesIO(img_bytes))
     if im.mode not in ("L", "RGB"):
         im = im.convert("RGB")
+
+    is_gray = im.mode == "L" or _is_effectively_grayscale(im)
+
+    apply_crop = False
     if crop_box is not None:
+        if is_gray:
+            T_, B_, L_, R_ = _detect_content_margins(im)
+            tight_sides = sum(1 for x in (T_, B_, L_, R_) if x < CROP_MIN_MARGIN_FRAC)
+            if tight_sides <= 1:
+                apply_crop = True
+        if crop_stats is not None:
+            if apply_crop:
+                crop_stats["applied"] += 1
+            elif not is_gray:
+                crop_stats["skipped_color"] += 1
+            else:
+                crop_stats["skipped_tight"] += 1
+
+    if apply_crop:
         W, H = im.size
         T, B, L, R = crop_box
         top_px = int(T * H)
@@ -654,7 +682,7 @@ def normalize_to_viewport(img_bytes: bytes,
         right_px = W - int(R * W)
         if right_px > left_px and bot_px > top_px:
             im = im.crop((left_px, top_px, right_px, bot_px))
-    if im.mode == "RGB" and _is_effectively_grayscale(im):
+    if im.mode == "RGB" and is_gray:
         im = im.convert("L")
     if (im.width, im.height) == (target_w, target_h):
         # Already correct size — re-emit with consistent encoder settings so
@@ -698,6 +726,10 @@ def build_epub(pdf_path: Path,
 
     rotate_ctx = _setup_auto_rotate(pdf_path) if auto_rotate else None
     crop_box = _setup_auto_crop(pdf_path) if auto_crop else None
+    crop_stats = (
+        {"applied": 0, "skipped_color": 0, "skipped_tight": 0}
+        if crop_box is not None else None
+    )
 
     # 1. Gather all page images into memory, normalized.
     print(f"[info] extracting & normalizing pages from {pdf_path.name}", file=sys.stderr)
@@ -706,7 +738,8 @@ def build_epub(pdf_path: Path,
     for i, raw, _ext in extract_page_images(pdf_path):
         if rotate_ctx is not None:
             raw = _maybe_rotate_page(raw, i, rotate_ctx, quality=quality)
-        jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality, crop_box=crop_box)
+        jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality,
+                                    crop_box=crop_box, crop_stats=crop_stats)
         if i == 0:
             image_id = "cover"
             image_name = "cover.jpg"
@@ -716,6 +749,14 @@ def build_epub(pdf_path: Path,
         page_blobs.append((image_id, image_name, jpg))
         if (i + 1) % 20 == 0 or i == 0:
             print(f"  page {i + 1} ... {len(jpg) / 1024:.1f} KB", file=sys.stderr)
+
+    if crop_stats is not None:
+        print(
+            f"[auto-crop] applied to {crop_stats['applied']} page(s); "
+            f"preserved {crop_stats['skipped_color']} color and "
+            f"{crop_stats['skipped_tight']} full-bleed illustration page(s)",
+            file=sys.stderr,
+        )
 
     total = len(page_blobs)
     if total == 0:
