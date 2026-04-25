@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import statistics
 import sys
 import uuid
 import zipfile
@@ -20,7 +21,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 from pypdf import PdfReader
 
 
@@ -32,6 +33,19 @@ JPEG_QUALITY = 78
 GRAYSCALE_DARK_LUM_MAX = 100      # pixels with L <= this count as "ink/line art"
 GRAYSCALE_SAT_THRESHOLD = 20.0    # mean saturation of dark pixels below this -> monochrome
 GRAYSCALE_DOWNSCALE_LONG_SIDE = 400
+
+# Auto-crop tuning (see _setup_auto_crop)
+CROP_THRESHOLD_OFFSET = 25
+CROP_THRESHOLD_FLOOR = 180
+CROP_DARK_PCT = 0.01
+CROP_DOWNSCALE_LONG_SIDE = 800
+CROP_SAMPLE_COUNT = 10
+CROP_SAMPLE_SKIP_PCT = 0.05
+CROP_OUTLIER_MAX_FRAC = 0.30
+CROP_OUTLIER_MIN_SUM = 0.01
+CROP_PERCENTILE = 25
+CROP_MIN_VALID_SAMPLES = 3
+CROP_MIN_MARGIN_FRAC = 0.03
 
 
 # ---------- Templates ----------
@@ -388,6 +402,157 @@ def _maybe_rotate_page(raw_bytes: bytes, idx: int, ctx: dict,
     return buf.getvalue()
 
 
+# ---------- Auto-crop (uniform fractional margin trim, default ON) ----------
+#
+# Scanned novels typically have 5-10% white margin on each side. Stripping
+# them lets the content fill more of the 1103x1600 viewport so text reads
+# larger. The detector:
+#
+#   1. Samples 10 pages from the middle 90% of the PDF.
+#   2. Per page: estimates paper color from 4 corner regions, builds an
+#      adaptive white threshold = max(180, paper - 25). This handles
+#      yellowed / sepia paper that fixed thresholds (e.g. 240) would treat
+#      as content.
+#   3. Per page: finds the first row/column from each edge whose dark-pixel
+#      fraction reaches 1% — this is the content edge. Margins are recorded
+#      as fractions of page dimensions (so PDFs with mixed page resolutions
+#      aggregate correctly).
+#   4. Filters samples where any margin > 30% (chapter ends, full-bleed art)
+#      or sum < 1% (dark pages, scan-frame pages).
+#   5. Picks the 25th percentile of each side across remaining samples and
+#      applies that uniform fractional crop to every page.
+#
+# Skipped (no cropping) when:
+#   - Fewer than 3 valid samples remain.
+#   - Any one of the 4 sides has < 3% margin at the 25th percentile.
+#     This is the cheap "is this manga?" test: manga pages typically bleed
+#     to at least one edge, so manga get this skip even if other sides have
+#     margins.
+
+def _detect_paper_color(im: Image.Image) -> float:
+    """Median brightness across 4 corner squares — robust paper-color estimate."""
+    g = im.convert("L")
+    w, h = g.size
+    sz = min(60, max(20, w // 30))
+    corners = [
+        g.crop((0, 0, sz, sz)),
+        g.crop((w - sz, 0, w, sz)),
+        g.crop((0, h - sz, sz, h)),
+        g.crop((w - sz, h - sz, w, h)),
+    ]
+    return statistics.median(ImageStat.Stat(c).mean[0] for c in corners)
+
+
+def _detect_content_margins(im: Image.Image) -> tuple[float, float, float, float]:
+    """Return (top, bottom, left, right) margins as fractions of page dimensions."""
+    paper = _detect_paper_color(im)
+    g = im.convert("L")
+    if max(g.size) > CROP_DOWNSCALE_LONG_SIDE:
+        s = CROP_DOWNSCALE_LONG_SIDE / max(g.size)
+        g = g.resize(
+            (max(1, int(g.width * s)), max(1, int(g.height * s))),
+            Image.LANCZOS,
+        )
+    g = g.filter(ImageFilter.MedianFilter(size=3))
+    threshold = max(CROP_THRESHOLD_FLOOR, int(paper - CROP_THRESHOLD_OFFSET))
+    w, h = g.size
+    mask = g.point(lambda v: 1 if v <= threshold else 0, mode="L")
+    data = mask.tobytes()
+    max_dark_row = max(1, int(w * CROP_DARK_PCT))
+    max_dark_col = max(1, int(h * CROP_DARK_PCT))
+
+    top = 0
+    while top < h and data[top * w:(top + 1) * w].count(1) < max_dark_row:
+        top += 1
+    bottom = 0
+    while bottom < h:
+        y = h - 1 - bottom
+        if data[y * w:(y + 1) * w].count(1) >= max_dark_row:
+            break
+        bottom += 1
+
+    g_t = mask.transpose(Image.Transpose.ROTATE_90)
+    w_t, h_t = g_t.size
+    data_t = g_t.tobytes()
+    left = 0
+    while left < h_t and data_t[left * w_t:(left + 1) * w_t].count(1) < max_dark_col:
+        left += 1
+    right = 0
+    while right < h_t:
+        y = h_t - 1 - right
+        if data_t[y * w_t:(y + 1) * w_t].count(1) >= max_dark_col:
+            break
+        right += 1
+
+    return (top / h, bottom / h, left / w, right / w)
+
+
+def _setup_auto_crop(pdf_path: Path) -> Optional[tuple[float, float, float, float]]:
+    """Return (T, B, L, R) fractional margins to crop, or None to skip."""
+    reader = PdfReader(str(pdf_path))
+    n = len(reader.pages)
+    if n < 5:
+        print("[auto-crop] skipped: too few pages", file=sys.stderr)
+        return None
+
+    lo = int(n * CROP_SAMPLE_SKIP_PCT)
+    hi = int(n * (1.0 - CROP_SAMPLE_SKIP_PCT))
+    if hi - lo < CROP_SAMPLE_COUNT:
+        idxs = list(range(lo, hi))
+    else:
+        step = (hi - lo) / CROP_SAMPLE_COUNT
+        idxs = [int(lo + step * i) for i in range(CROP_SAMPLE_COUNT)]
+
+    fracs: list[tuple[float, float, float, float]] = []
+    for i in idxs:
+        try:
+            imgs = list(reader.pages[i].images)
+            if not imgs:
+                continue
+            im = imgs[0].image
+            fracs.append(_detect_content_margins(im))
+        except Exception:
+            continue
+
+    clean = [
+        f for f in fracs
+        if max(f) < CROP_OUTLIER_MAX_FRAC and sum(f) >= CROP_OUTLIER_MIN_SUM
+    ]
+    if len(clean) < CROP_MIN_VALID_SAMPLES:
+        print(
+            f"[auto-crop] skipped: only {len(clean)} valid samples "
+            f"(need {CROP_MIN_VALID_SAMPLES})",
+            file=sys.stderr,
+        )
+        return None
+
+    def _percentile(vals: list[float], p: int) -> float:
+        s = sorted(vals)
+        return s[int(p / 100 * (len(s) - 1))]
+
+    T = _percentile([f[0] for f in clean], CROP_PERCENTILE)
+    B = _percentile([f[1] for f in clean], CROP_PERCENTILE)
+    L = _percentile([f[2] for f in clean], CROP_PERCENTILE)
+    R = _percentile([f[3] for f in clean], CROP_PERCENTILE)
+
+    if min(T, B, L, R) < CROP_MIN_MARGIN_FRAC:
+        print(
+            f"[auto-crop] skipped: T={T*100:.1f}% B={B*100:.1f}% "
+            f"L={L*100:.1f}% R={R*100:.1f}% — a side <"
+            f"{int(CROP_MIN_MARGIN_FRAC*100)}% (manga / edge content)",
+            file=sys.stderr,
+        )
+        return None
+
+    print(
+        f"[auto-crop] enabled: T={T*100:.1f}% B={B*100:.1f}% "
+        f"L={L*100:.1f}% R={R*100:.1f}% "
+        f"({len(clean)}/{len(fracs)} valid samples)",
+        file=sys.stderr,
+    )
+    return (T, B, L, R)
+
+
 # ---------- Image extraction & normalization ----------
 
 def extract_page_images(pdf_path: Path):
@@ -465,16 +630,30 @@ def _is_effectively_grayscale(im: Image.Image) -> bool:
 def normalize_to_viewport(img_bytes: bytes,
                           target_w: int = VIEWPORT_W,
                           target_h: int = VIEWPORT_H,
-                          quality: int = JPEG_QUALITY) -> bytes:
+                          quality: int = JPEG_QUALITY,
+                          crop_box: Optional[tuple[float, float, float, float]] = None) -> bytes:
     """Fit-resize into target_w x target_h, letterboxing with white.
 
     RGB images that are essentially monochrome (B&W manga interiors, even
     with sepia paper tone) are auto-converted to L mode for smaller files
     with no perceptible quality loss.
+
+    crop_box: optional (T, B, L, R) fractional margins (0..1) to strip from
+    each side before fitting. Applied per-page using the page's own
+    dimensions, so the same fractions work for PDFs with mixed page sizes.
     """
     im = Image.open(BytesIO(img_bytes))
     if im.mode not in ("L", "RGB"):
         im = im.convert("RGB")
+    if crop_box is not None:
+        W, H = im.size
+        T, B, L, R = crop_box
+        top_px = int(T * H)
+        bot_px = H - int(B * H)
+        left_px = int(L * W)
+        right_px = W - int(R * W)
+        if right_px > left_px and bot_px > top_px:
+            im = im.crop((left_px, top_px, right_px, bot_px))
     if im.mode == "RGB" and _is_effectively_grayscale(im):
         im = im.convert("L")
     if (im.width, im.height) == (target_w, target_h):
@@ -512,11 +691,13 @@ def build_epub(pdf_path: Path,
                author: str,
                direction: str = "rtl",
                quality: int = JPEG_QUALITY,
-               auto_rotate: bool = True) -> None:
+               auto_rotate: bool = True,
+               auto_crop: bool = True) -> None:
     uid = str(uuid.uuid4())
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     rotate_ctx = _setup_auto_rotate(pdf_path) if auto_rotate else None
+    crop_box = _setup_auto_crop(pdf_path) if auto_crop else None
 
     # 1. Gather all page images into memory, normalized.
     print(f"[info] extracting & normalizing pages from {pdf_path.name}", file=sys.stderr)
@@ -525,7 +706,7 @@ def build_epub(pdf_path: Path,
     for i, raw, _ext in extract_page_images(pdf_path):
         if rotate_ctx is not None:
             raw = _maybe_rotate_page(raw, i, rotate_ctx, quality=quality)
-        jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality)
+        jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality, crop_box=crop_box)
         if i == 0:
             image_id = "cover"
             image_name = "cover.jpg"
@@ -676,6 +857,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="disable auto-rotation of misscanned landscape pages "
                          "(default: enabled — landscape pages whose dimensions "
                          "match a 90°-rotated portrait page are auto-rotated)")
+    ap.add_argument("--no-auto-crop", action="store_true",
+                    help="disable auto-cropping of page margins "
+                         "(default: enabled — uniform fractional crop is "
+                         "applied when all 4 sides have detected margin ≥ 3%; "
+                         "manga and bleed pages are skipped automatically)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing output file")
     args = ap.parse_args(argv)
@@ -707,7 +893,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         build_epub(pdf_path, out_path, title, author,
                    direction=args.direction, quality=args.quality,
-                   auto_rotate=not args.no_auto_rotate)
+                   auto_rotate=not args.no_auto_rotate,
+                   auto_crop=not args.no_auto_crop)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
