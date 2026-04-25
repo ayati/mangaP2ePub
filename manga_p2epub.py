@@ -20,7 +20,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 from pypdf import PdfReader
 
 
@@ -28,7 +28,10 @@ from pypdf import PdfReader
 
 VIEWPORT_W = 1103
 VIEWPORT_H = 1600
-JPEG_QUALITY = 88
+JPEG_QUALITY = 78
+GRAYSCALE_DARK_LUM_MAX = 100      # pixels with L <= this count as "ink/line art"
+GRAYSCALE_SAT_THRESHOLD = 20.0    # mean saturation of dark pixels below this -> monochrome
+GRAYSCALE_DOWNSCALE_LONG_SIDE = 400
 
 
 # ---------- Templates ----------
@@ -426,14 +429,54 @@ def extract_page_images(pdf_path: Path):
             )
 
 
+def _is_effectively_grayscale(im: Image.Image) -> bool:
+    """
+    Decide whether an RGB image is essentially monochrome.
+
+    Looks at the mean saturation (max RGB - min RGB) of *dark* pixels only.
+    Manga line-art and ink are achromatic even when the surrounding paper is
+    sepia-toned, so dark-pixel saturation cleanly separates a color cover
+    (saturation 50+) from a B&W interior page (saturation under ~20).
+    """
+    if im.mode in ("L", "1"):
+        return True
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    if max(im.size) > GRAYSCALE_DOWNSCALE_LONG_SIDE:
+        s = GRAYSCALE_DOWNSCALE_LONG_SIDE / max(im.size)
+        im = im.resize(
+            (max(1, int(im.width * s)), max(1, int(im.height * s))),
+            Image.NEAREST,
+        )
+    r, g, b = im.split()
+    hi = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    lo = ImageChops.darker(ImageChops.darker(r, g), b)
+    sat = ImageChops.difference(hi, lo)
+    lum = im.convert("L")
+    dark_mask = lum.point(
+        lambda v: 255 if v <= GRAYSCALE_DARK_LUM_MAX else 0, mode="L"
+    )
+    if dark_mask.getextrema() == (0, 0):
+        # No dark pixels — page is blank-ish; grayscale is safe.
+        return True
+    return ImageStat.Stat(sat, mask=dark_mask).mean[0] < GRAYSCALE_SAT_THRESHOLD
+
+
 def normalize_to_viewport(img_bytes: bytes,
                           target_w: int = VIEWPORT_W,
                           target_h: int = VIEWPORT_H,
                           quality: int = JPEG_QUALITY) -> bytes:
-    """Fit-resize into target_w x target_h, letterboxing with white."""
+    """Fit-resize into target_w x target_h, letterboxing with white.
+
+    RGB images that are essentially monochrome (B&W manga interiors, even
+    with sepia paper tone) are auto-converted to L mode for smaller files
+    with no perceptible quality loss.
+    """
     im = Image.open(BytesIO(img_bytes))
     if im.mode not in ("L", "RGB"):
         im = im.convert("RGB")
+    if im.mode == "RGB" and _is_effectively_grayscale(im):
+        im = im.convert("L")
     if (im.width, im.height) == (target_w, target_h):
         # Already correct size — re-emit with consistent encoder settings so
         # readers don't trip over unusual JPEG variants.
@@ -627,7 +670,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--direction", choices=("rtl", "ltr"), default="rtl",
                     help="page progression (default: rtl)")
     ap.add_argument("--quality", type=int, default=JPEG_QUALITY,
-                    help=f"JPEG quality 1-95 (default: {JPEG_QUALITY})")
+                    help=f"JPEG quality 1-95 (default: {JPEG_QUALITY}; "
+                         f"raise for higher fidelity at the cost of file size)")
     ap.add_argument("--no-auto-rotate", action="store_true",
                     help="disable auto-rotation of misscanned landscape pages "
                          "(default: enabled — landscape pages whose dimensions "
