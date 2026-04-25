@@ -173,6 +173,218 @@ def default_output_path(pdf_path: Path, title: str, author: Optional[str]) -> Pa
     return pdf_path.with_name(sanitize_filename(base) + ".epub")
 
 
+# ---------- Auto-rotate (misscanned landscape page → portrait) ----------
+#
+# ScanSnap and similar document scanners sometimes mis-detect a portrait page
+# as landscape when the OCR layer mistakes the text orientation. The image is
+# then stored 90° rotated. The functions below detect those pages by:
+#   1. Pre-scanning every page's dimensions.
+#   2. Treating a landscape page as a "misscan candidate" only when its
+#      (w, h) roughly matches the portrait median rotated 90° — this skips
+#      genuine landscape spreads / covers (which are typically 2x wider).
+#   3. Learning whether portraits in this book have wider top or bottom
+#      margins, then matching the wider side of the landscape page (left or
+#      right) to decide which way to rotate.
+#
+# Misjudged direction is acceptable per spec — the user can rotate in the
+# viewer. The hard requirement is to never leave a misscanned page sideways.
+
+DEFAULT_LANDSCAPE_RATIO = 1.05      # w/h ratio above which a page is "landscape"
+DEFAULT_DIM_TOL = 0.10              # ±10% match against portrait median (rotated)
+EDGE_BAND_PCT = 0.10                # measure mean brightness over this edge fraction
+EDGE_DOWNSCALE_LONG_SIDE = 600      # downscale long side before measurement
+ROTATION_CONFIDENCE_THRESHOLD = 2.0    # |brighter - dimmer| (0..255) below this -> uncertain
+CONVENTION_SAMPLE_TARGET = 5        # collect this many portrait samples
+CONVENTION_SKIP_FIRST_PAGES = 2     # skip cover/colophon pages when sampling
+NEAR_BLANK_BRIGHTNESS = 250         # if both edges are above this, the page is nearly blank
+
+
+def _prescan_dims(pdf_path: Path) -> list[tuple[int, int, int]]:
+    """Return [(page_idx, image_w, image_h), ...] for every page (cheap header read)."""
+    reader = PdfReader(str(pdf_path))
+    out: list[tuple[int, int, int]] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            imgs = list(page.images)
+            if not imgs:
+                out.append((i, 0, 0))
+                continue
+            im = imgs[0].image  # PIL header parse, no full decode
+            out.append((i, im.width, im.height))
+        except Exception:
+            out.append((i, 0, 0))
+    return out
+
+
+def _is_landscape(w: int, h: int, ratio: float = DEFAULT_LANDSCAPE_RATIO) -> bool:
+    return w > 0 and h > 0 and w > h * ratio
+
+
+def _is_misscan_candidate(w: int, h: int,
+                          pw_med: int, ph_med: int,
+                          tol: float = DEFAULT_DIM_TOL) -> bool:
+    """True if a landscape page's dimensions match a portrait page rotated 90°."""
+    if not _is_landscape(w, h):
+        return False
+    return ((1 - tol) * ph_med <= w <= (1 + tol) * ph_med
+            and (1 - tol) * pw_med <= h <= (1 + tol) * pw_med)
+
+
+def _edge_brightness(im: Image.Image, axis: str) -> tuple[float, float]:
+    """
+    axis="v" -> (top_band_mean, bottom_band_mean), each on a 0..255 scale.
+    axis="h" -> (left_band_mean, right_band_mean).
+
+    The "brighter" band has more whitespace relative to ink — i.e., it
+    corresponds to the wider page margin in the original portrait. This holds
+    even when the image has no clean white border (manga pages whose panel
+    borders bleed to the edge), because the bottom edge often carries the page
+    number while the top edge does not.
+    """
+    g = im.convert("L")
+    long_side = max(g.size)
+    if long_side > EDGE_DOWNSCALE_LONG_SIDE:
+        scale = EDGE_DOWNSCALE_LONG_SIDE / long_side
+        g = g.resize(
+            (max(1, int(g.width * scale)), max(1, int(g.height * scale))),
+            Image.LANCZOS,
+        )
+    w, h = g.size
+    if axis == "v":
+        bw = max(1, int(h * EDGE_BAND_PCT))
+        a = g.crop((0, 0, w, bw))
+        b = g.crop((0, h - bw, w, h))
+    else:
+        bw = max(1, int(w * EDGE_BAND_PCT))
+        a = g.crop((0, 0, bw, h))
+        b = g.crop((w - bw, 0, w, h))
+    from PIL import ImageStat
+    return ImageStat.Stat(a).mean[0], ImageStat.Stat(b).mean[0]
+
+
+def _learn_convention(samples: list[tuple[float, float]]) -> Optional[str]:
+    """Sum signed (top - bottom) brightness deltas. >0 -> 'top_wider'."""
+    if not samples:
+        return None
+    diff = sum(t - b for t, b in samples)
+    if diff == 0:
+        return None
+    return "top_wider" if diff > 0 else "bottom_wider"
+
+
+def _decide_rotation(landscape_im: Image.Image,
+                     convention: Optional[str]) -> tuple[Image.Transpose, str]:
+    """
+    Decide how to rotate a landscape page back to portrait.
+
+    Returns (PIL transpose constant, human-readable label).
+      ROTATE_90  = CCW (input's RIGHT side -> output TOP)
+      ROTATE_270 = CW  (input's LEFT  side -> output TOP)
+    """
+    left, right = _edge_brightness(landscape_im, axis="h")
+    diff = left - right
+
+    if convention is None or abs(diff) < ROTATION_CONFIDENCE_THRESHOLD:
+        return Image.Transpose.ROTATE_270, "CW (uncertain, defaulted)"
+
+    landscape_brighter = "left" if diff > 0 else "right"
+    if convention == "top_wider":
+        original_top = landscape_brighter
+    else:
+        original_top = "right" if landscape_brighter == "left" else "left"
+
+    if original_top == "left":
+        return Image.Transpose.ROTATE_270, "CW"
+    return Image.Transpose.ROTATE_90, "CCW"
+
+
+def _setup_auto_rotate(pdf_path: Path) -> Optional[dict]:
+    """Pre-scan dimensions and decide whether auto-rotate should be active."""
+    dims = _prescan_dims(pdf_path)
+    if not dims:
+        return None
+    portraits = [(w, h) for _, w, h in dims if 0 < w < h]
+    n_total = sum(1 for _, w, h in dims if w > 0 and h > 0)
+    if not portraits:
+        print("[auto-rotate] no portrait pages found — disabled", file=sys.stderr)
+        return None
+    if len(portraits) / max(1, n_total) <= 0.5:
+        print("[auto-rotate] PDF is not portrait-dominant — disabled", file=sys.stderr)
+        return None
+    pw_med = sorted(w for w, _ in portraits)[len(portraits) // 2]
+    ph_med = sorted(h for _, h in portraits)[len(portraits) // 2]
+    candidates = [
+        idx for idx, w, h in dims
+        if _is_misscan_candidate(w, h, pw_med, ph_med)
+    ]
+    if not candidates:
+        print("[auto-rotate] no misscan-candidate pages found — nothing to rotate",
+              file=sys.stderr)
+        return None
+    print(
+        f"[auto-rotate] portrait median {pw_med}x{ph_med}; "
+        f"{len(candidates)} candidate page(s): "
+        f"{[c + 1 for c in candidates[:10]]}"
+        f"{' ...' if len(candidates) > 10 else ''}",
+        file=sys.stderr,
+    )
+    return {
+        "dims": {idx: (w, h) for idx, w, h in dims},
+        "pw_med": pw_med,
+        "ph_med": ph_med,
+        "convention_samples": [],
+        "convention": None,
+    }
+
+
+def _maybe_rotate_page(raw_bytes: bytes, idx: int, ctx: dict,
+                       quality: int = JPEG_QUALITY) -> bytes:
+    """Rotate page `idx` if it's a misscan candidate; otherwise return raw_bytes."""
+    w, h = ctx["dims"].get(idx, (0, 0))
+    pw_med, ph_med = ctx["pw_med"], ctx["ph_med"]
+
+    is_std_portrait = (
+        0 < w < h
+        and (1 - DEFAULT_DIM_TOL) * pw_med <= w <= (1 + DEFAULT_DIM_TOL) * pw_med
+        and (1 - DEFAULT_DIM_TOL) * ph_med <= h <= (1 + DEFAULT_DIM_TOL) * ph_med
+    )
+    if (is_std_portrait
+            and idx >= CONVENTION_SKIP_FIRST_PAGES
+            and len(ctx["convention_samples"]) < CONVENTION_SAMPLE_TARGET):
+        try:
+            sample_im = Image.open(BytesIO(raw_bytes))
+            t, b = _edge_brightness(sample_im, axis="v")
+            if t < NEAR_BLANK_BRIGHTNESS or b < NEAR_BLANK_BRIGHTNESS:
+                ctx["convention_samples"].append((t, b))
+                ctx["convention"] = _learn_convention(ctx["convention_samples"])
+        except Exception as e:
+            print(f"[auto-rotate] page {idx + 1}: brightness sample failed ({e})",
+                  file=sys.stderr)
+
+    if not _is_misscan_candidate(w, h, pw_med, ph_med):
+        return raw_bytes
+
+    try:
+        im = Image.open(BytesIO(raw_bytes))
+    except Exception as e:
+        print(f"[auto-rotate] page {idx + 1}: decode failed, skip rotate ({e})",
+              file=sys.stderr)
+        return raw_bytes
+
+    rot, label = _decide_rotation(im, ctx["convention"])
+    rotated = im.transpose(rot)
+    if rotated.mode not in ("L", "RGB"):
+        rotated = rotated.convert("RGB")
+    buf = BytesIO()
+    rotated.save(buf, "JPEG", quality=quality, optimize=True)
+    print(
+        f"[auto-rotate] page {idx + 1}: {w}x{h} -> "
+        f"{rotated.width}x{rotated.height} ({label})",
+        file=sys.stderr,
+    )
+    return buf.getvalue()
+
+
 # ---------- Image extraction & normalization ----------
 
 def extract_page_images(pdf_path: Path):
@@ -256,15 +468,20 @@ def build_epub(pdf_path: Path,
                title: str,
                author: str,
                direction: str = "rtl",
-               quality: int = JPEG_QUALITY) -> None:
+               quality: int = JPEG_QUALITY,
+               auto_rotate: bool = True) -> None:
     uid = str(uuid.uuid4())
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    rotate_ctx = _setup_auto_rotate(pdf_path) if auto_rotate else None
 
     # 1. Gather all page images into memory, normalized.
     print(f"[info] extracting & normalizing pages from {pdf_path.name}", file=sys.stderr)
     page_blobs: list[tuple[str, str, bytes]] = []
     # each entry: (image_id, image_filename, jpeg_bytes)
     for i, raw, _ext in extract_page_images(pdf_path):
+        if rotate_ctx is not None:
+            raw = _maybe_rotate_page(raw, i, rotate_ctx, quality=quality)
         jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality)
         if i == 0:
             image_id = "cover"
@@ -411,6 +628,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="page progression (default: rtl)")
     ap.add_argument("--quality", type=int, default=JPEG_QUALITY,
                     help=f"JPEG quality 1-95 (default: {JPEG_QUALITY})")
+    ap.add_argument("--no-auto-rotate", action="store_true",
+                    help="disable auto-rotation of misscanned landscape pages "
+                         "(default: enabled — landscape pages whose dimensions "
+                         "match a 90°-rotated portrait page are auto-rotated)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing output file")
     args = ap.parse_args(argv)
@@ -441,7 +662,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         build_epub(pdf_path, out_path, title, author,
-                   direction=args.direction, quality=args.quality)
+                   direction=args.direction, quality=args.quality,
+                   auto_rotate=not args.no_auto_rotate)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
