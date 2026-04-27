@@ -32,6 +32,9 @@ VIEWPORT_H = 1600
 JPEG_QUALITY = 78
 GRAYSCALE_DARK_LUM_MAX = 100      # pixels with L <= this count as "ink/line art"
 GRAYSCALE_SAT_THRESHOLD = 20.0    # mean saturation of dark pixels below this -> monochrome
+GRAYSCALE_CHROMA_STD_MAX = 15.0   # std of R-G / G-B channels below this -> monochrome
+                                  # (catches sepia / yellowed paper, where the ink picks up
+                                  # the paper tint and dark-pixel saturation creeps above 20)
 GRAYSCALE_DOWNSCALE_LONG_SIDE = 400
 
 # Auto-crop tuning (see _setup_auto_crop)
@@ -46,6 +49,15 @@ CROP_OUTLIER_MIN_SUM = 0.01
 CROP_PERCENTILE = 25
 CROP_MIN_VALID_SAMPLES = 3
 CROP_MIN_MARGIN_FRAC = 0.03
+CROP_PER_PAGE_SAFETY = 0.015      # buffer between page's detected content edge and crop
+CROP_PER_PAGE_TRUST_MIN = 0.01    # below this, treat per-page detection as unreliable
+                                  # (likely a header / footer / scan artifact at the edge)
+CROP_BOOK_LR_BACKOFF = 0.03       # subtract from book-level L/R after percentile.
+                                  # Detection only finds the body-text edge; running titles,
+                                  # page numbers and binding shift can extend closer to the
+                                  # actual paper edge than the body, so a uniform backoff
+                                  # protects those elements on pages whose detected margin
+                                  # exceeds the percentile (no per-page cap is triggered).
 
 
 # ---------- Templates ----------
@@ -560,22 +572,25 @@ def _setup_auto_crop(pdf_path: Path) -> Optional[tuple[float, float, float, floa
 
     T = _percentile([f[0] for f in clean], CROP_PERCENTILE)
     B = _percentile([f[1] for f in clean], CROP_PERCENTILE)
-    L = _percentile([f[2] for f in clean], CROP_PERCENTILE)
-    R = _percentile([f[3] for f in clean], CROP_PERCENTILE)
+    L_raw = _percentile([f[2] for f in clean], CROP_PERCENTILE)
+    R_raw = _percentile([f[3] for f in clean], CROP_PERCENTILE)
 
-    if min(T, B, L, R) < CROP_MIN_MARGIN_FRAC:
+    if min(T, B, L_raw, R_raw) < CROP_MIN_MARGIN_FRAC:
         print(
             f"[auto-crop] skipped: T={T*100:.1f}% B={B*100:.1f}% "
-            f"L={L*100:.1f}% R={R*100:.1f}% — a side <"
+            f"L={L_raw*100:.1f}% R={R_raw*100:.1f}% — a side <"
             f"{int(CROP_MIN_MARGIN_FRAC*100)}% (manga / edge content)",
             file=sys.stderr,
         )
         return None
 
+    L = max(0.0, L_raw - CROP_BOOK_LR_BACKOFF)
+    R = max(0.0, R_raw - CROP_BOOK_LR_BACKOFF)
     print(
         f"[auto-crop] enabled: T={T*100:.1f}% B={B*100:.1f}% "
         f"L={L*100:.1f}% R={R*100:.1f}% "
-        f"({len(clean)}/{len(fracs)} valid samples)",
+        f"(raw L={L_raw*100:.1f}% R={R_raw*100:.1f}%, "
+        f"{len(clean)}/{len(fracs)} valid samples)",
         file=sys.stderr,
     )
     return (T, B, L, R)
@@ -643,10 +658,17 @@ def _is_effectively_grayscale(im: Image.Image) -> bool:
     """
     Decide whether an RGB image is essentially monochrome.
 
-    Looks at the mean saturation (max RGB - min RGB) of *dark* pixels only.
-    Manga line-art and ink are achromatic even when the surrounding paper is
-    sepia-toned, so dark-pixel saturation cleanly separates a color cover
-    (saturation 50+) from a B&W interior page (saturation under ~20).
+    Two complementary tests; either is sufficient:
+
+      1. Hue uniformity. The std of per-pixel R-G and G-B is small for a page
+         with a single dominant hue (white, sepia, or any other uniformly
+         tinted paper) and large for multi-color illustrations. This catches
+         yellowed / age-tanned paper where the ink absorbs some paper tint
+         and the dark-pixel saturation creeps above the threshold below.
+      2. Dark-pixel saturation. Mean saturation (max RGB - min RGB) over dark
+         pixels only. Stays low for B&W line-art even on noisy scans where the
+         hue-uniformity test fails because the paper itself has scan-induced
+         color variation.
     """
     if im.mode in ("L", "1"):
         return True
@@ -659,6 +681,20 @@ def _is_effectively_grayscale(im: Image.Image) -> bool:
             Image.NEAREST,
         )
     r, g, b = im.split()
+
+    # Test 1: chroma std. Offset 128 lets us measure signed differences via
+    # an unsigned subtract; |R-G| > 127 is rare in scanned book pages and
+    # would only clamp at extremes that already register as colorful.
+    rg = ImageChops.subtract(r, g, scale=1, offset=128)
+    gb = ImageChops.subtract(g, b, scale=1, offset=128)
+    chroma_std = max(
+        ImageStat.Stat(rg).stddev[0],
+        ImageStat.Stat(gb).stddev[0],
+    )
+    if chroma_std < GRAYSCALE_CHROMA_STD_MAX:
+        return True
+
+    # Test 2: dark-pixel saturation.
     hi = ImageChops.lighter(ImageChops.lighter(r, g), b)
     lo = ImageChops.darker(ImageChops.darker(r, g), b)
     sat = ImageChops.difference(hi, lo)
@@ -696,6 +732,18 @@ def normalize_to_viewport(img_bytes: bytes,
     B&W illustration that should stay full-frame. This preserves covers,
     frontispieces, and in-body illustrations while uniformly cropping the
     body text pages.
+
+    Per-page cap: physical book trimming has per-page binding variation, so
+    a uniform crop can shave text off the side that ended up tighter than
+    the book median. Top, left, and right are capped at the page's own
+    detected margin minus a small safety buffer. Bottom is left uncapped
+    because page numbers typically pin per-page bottom detection at 0% even
+    on otherwise normal text pages — capping there would suppress the crop
+    everywhere. A per-page side measuring below CROP_PER_PAGE_TRUST_MIN is
+    distrusted (likely a header line or scan artifact reaching the edge);
+    those sides fall back to the book-level value rather than skipping the
+    crop, since the tight_sides guard above already preserved any genuine
+    edge-content pages.
     """
     im = Image.open(BytesIO(img_bytes))
     if im.mode not in ("L", "RGB"):
@@ -704,10 +752,11 @@ def normalize_to_viewport(img_bytes: bytes,
     is_gray = im.mode == "L" or _is_effectively_grayscale(im)
 
     apply_crop = False
+    page_margins: Optional[tuple[float, float, float, float]] = None
     if crop_box is not None:
         if is_gray:
-            T_, B_, L_, R_ = _detect_content_margins(im)
-            tight_sides = sum(1 for x in (T_, B_, L_, R_) if x < CROP_MIN_MARGIN_FRAC)
+            page_margins = _detect_content_margins(im)
+            tight_sides = sum(1 for x in page_margins if x < CROP_MIN_MARGIN_FRAC)
             if tight_sides <= 1:
                 apply_crop = True
         if crop_stats is not None:
@@ -720,7 +769,24 @@ def normalize_to_viewport(img_bytes: bytes,
 
     if apply_crop:
         W, H = im.size
-        T, B, L, R = crop_box
+        T_, B_, L_, R_ = page_margins  # type: ignore[misc]
+
+        def _cap(book_val: float, page_val: float) -> float:
+            if page_val < CROP_PER_PAGE_TRUST_MIN:
+                return book_val
+            return min(book_val, max(0.0, page_val - CROP_PER_PAGE_SAFETY))
+
+        T = _cap(crop_box[0], T_)
+        B = crop_box[1]  # see docstring: bottom is uncapped
+        L = _cap(crop_box[2], L_)
+        R = _cap(crop_box[3], R_)
+        if crop_stats is not None:
+            for book_v, page_v, side in (
+                (crop_box[0], T_, "T"), (crop_box[2], L_, "L"), (crop_box[3], R_, "R"),
+            ):
+                if (page_v >= CROP_PER_PAGE_TRUST_MIN
+                        and page_v - CROP_PER_PAGE_SAFETY < book_v):
+                    crop_stats[f"capped_{side}"] = crop_stats.get(f"capped_{side}", 0) + 1
         top_px = int(T * H)
         bot_px = H - int(B * H)
         left_px = int(L * W)
@@ -802,6 +868,13 @@ def build_epub(pdf_path: Path,
             f"{crop_stats['skipped_tight']} full-bleed illustration page(s)",
             file=sys.stderr,
         )
+        capped = {s: crop_stats.get(f"capped_{s}", 0) for s in ("T", "L", "R")}
+        if any(capped.values()):
+            print(
+                f"[auto-crop] per-page cap protected content on "
+                f"T={capped['T']} L={capped['L']} R={capped['R']} page(s)",
+                file=sys.stderr,
+            )
 
     total = len(page_blobs)
     if total == 0:
