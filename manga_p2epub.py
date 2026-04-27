@@ -216,8 +216,33 @@ CONVENTION_SKIP_FIRST_PAGES = 2     # skip cover/colophon pages when sampling
 NEAR_BLANK_BRIGHTNESS = 250         # if both edges are above this, the page is nearly blank
 
 
+def _page_rotation(page) -> int:
+    """Return the page's /Rotate value normalized to {0, 90, 180, 270}."""
+    rot = page.get("/Rotate", 0) or 0
+    try:
+        rot = int(rot)
+    except (TypeError, ValueError):
+        rot = 0
+    return rot % 360
+
+
+def _apply_pdf_rotation(im: Image.Image, rotate_deg: int) -> Image.Image:
+    """Apply a PDF /Rotate value (clockwise degrees) to a PIL image."""
+    if rotate_deg == 90:
+        return im.transpose(Image.Transpose.ROTATE_270)  # 90° CW
+    if rotate_deg == 180:
+        return im.transpose(Image.Transpose.ROTATE_180)
+    if rotate_deg == 270:
+        return im.transpose(Image.Transpose.ROTATE_90)   # 90° CCW
+    return im
+
+
 def _prescan_dims(pdf_path: Path) -> list[tuple[int, int, int]]:
-    """Return [(page_idx, image_w, image_h), ...] for every page (cheap header read)."""
+    """Return [(page_idx, display_w, display_h), ...] for every page.
+
+    Dimensions reflect the page's /Rotate value so downstream landscape
+    detection sees the same orientation a PDF reader would render.
+    """
     reader = PdfReader(str(pdf_path))
     out: list[tuple[int, int, int]] = []
     for i, page in enumerate(reader.pages):
@@ -227,7 +252,10 @@ def _prescan_dims(pdf_path: Path) -> list[tuple[int, int, int]]:
                 out.append((i, 0, 0))
                 continue
             im = imgs[0].image  # PIL header parse, no full decode
-            out.append((i, im.width, im.height))
+            w, h = im.width, im.height
+            if _page_rotation(page) in (90, 270):
+                w, h = h, w
+            out.append((i, w, h))
         except Exception:
             out.append((i, 0, 0))
     return out
@@ -555,28 +583,42 @@ def _setup_auto_crop(pdf_path: Path) -> Optional[tuple[float, float, float, floa
 
 # ---------- Image extraction & normalization ----------
 
+def _encode_jpeg(im: Image.Image, quality: int = JPEG_QUALITY) -> bytes:
+    if im.mode not in ("L", "RGB"):
+        im = im.convert("RGB")
+    buf = BytesIO()
+    im.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
 def extract_page_images(pdf_path: Path):
     """
     Yield (page_index, raw_bytes, ext_hint) for every PDF page.
 
-    - If the page contains exactly one embedded JPEG, yield its raw bytes
-      untouched (lossless pass-through; the normalizer may still re-encode
-      to hit the target viewport).
+    - If the page contains exactly one embedded JPEG and /Rotate is 0,
+      yield its raw bytes untouched (lossless pass-through; the normalizer
+      may still re-encode to hit the target viewport).
+    - If /Rotate is 90/180/270 (set by a PDF editor to fix orientation),
+      apply that rotation to the extracted image so the EPUB matches what
+      a PDF reader would display.
     - Otherwise rasterize the page via Pillow through pypdf's decoded image.
     """
     reader = PdfReader(str(pdf_path))
     for i, page in enumerate(reader.pages):
+        rot = _page_rotation(page)
         images = list(page.images)
         if len(images) == 1:
             img = images[0]
             data = img.data
-            if data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9":
+            if rot == 0 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9":
                 yield i, data, "jpeg"
                 continue
-            # Non-JPEG single image: hand off decoded PIL for re-encode.
-            buf = BytesIO()
-            img.image.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
-            yield i, buf.getvalue(), "jpeg"
+            im = img.image
+            if rot:
+                im = _apply_pdf_rotation(im, rot)
+                print(f"[pdf-rotate] page {i + 1}: applied /Rotate={rot}",
+                      file=sys.stderr)
+            yield i, _encode_jpeg(im), "jpeg"
             continue
         # 0 or >=2 images on a page — fall back to a rasterized PIL render.
         # pypdf can't rasterize vector content; as a v0.1 compromise, we
@@ -584,9 +626,12 @@ def extract_page_images(pdf_path: Path):
         print(f"[warn] page {i + 1}: {len(images)} images found, "
               f"falling back to first image only", file=sys.stderr)
         if images:
-            buf = BytesIO()
-            images[0].image.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
-            yield i, buf.getvalue(), "jpeg"
+            im = images[0].image
+            if rot:
+                im = _apply_pdf_rotation(im, rot)
+                print(f"[pdf-rotate] page {i + 1}: applied /Rotate={rot}",
+                      file=sys.stderr)
+            yield i, _encode_jpeg(im), "jpeg"
         else:
             raise RuntimeError(
                 f"page {i + 1} contains no extractable image; "
