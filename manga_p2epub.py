@@ -61,6 +61,14 @@ CROP_ARTIFACT_ZERO_FRAC = 0.40    # if at least this fraction of sampled pages r
                                   # threshold and the book gets correctly skipped.
 CROP_ARTIFACT_MIN_NONZERO = 2     # require at least this many non-zero samples to apply
                                   # the artifact filter; otherwise fall back to all samples
+CROP_BOOK_LR_MAX = 0.05           # hard ceiling on the book-level L/R crop fraction.
+                                  # Smartphone reading screens are typically portrait, so the
+                                  # cropped image is displayed close to its native width;
+                                  # over-aggressive horizontal cropping leaves the first/last
+                                  # text column visually grazing the page edge. Capping at 5%
+                                  # keeps a comfortable margin even on books whose detection
+                                  # reports very wide L/R, at the cost of leaving a bit of
+                                  # paper on each side. Vertical (T/B) crop is not capped.
 CROP_BOOK_LR_BACKOFF = 0.03       # subtract from book-level L/R after percentile.
                                   # Detection only finds the body-text edge; running titles,
                                   # page numbers and binding shift can extend closer to the
@@ -618,8 +626,8 @@ def _setup_auto_crop(pdf_path: Path) -> Optional[tuple[float, float, float, floa
         )
         return None
 
-    L = max(0.0, L_raw - CROP_BOOK_LR_BACKOFF)
-    R = max(0.0, R_raw - CROP_BOOK_LR_BACKOFF)
+    L = min(max(0.0, L_raw - CROP_BOOK_LR_BACKOFF), CROP_BOOK_LR_MAX)
+    R = min(max(0.0, R_raw - CROP_BOOK_LR_BACKOFF), CROP_BOOK_LR_MAX)
     print(
         f"[auto-crop] enabled: T={T*100:.1f}% B={B*100:.1f}% "
         f"L={L*100:.1f}% R={R*100:.1f}% "
