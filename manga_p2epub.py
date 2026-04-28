@@ -52,6 +52,15 @@ CROP_MIN_MARGIN_FRAC = 0.03
 CROP_PER_PAGE_SAFETY = 0.015      # buffer between page's detected content edge and crop
 CROP_PER_PAGE_TRUST_MIN = 0.01    # below this, treat per-page detection as unreliable
                                   # (likely a header / footer / scan artifact at the edge)
+CROP_ARTIFACT_ZERO_FRAC = 0.40    # if at least this fraction of sampled pages return 0%
+                                  # on a given side, treat the 0% as a systematic scanner
+                                  # artifact (e.g., 1-3 row dark band at the page edge from
+                                  # binding shadow) and exclude those samples when picking
+                                  # the percentile. Manga has occasional full-bleed pages
+                                  # that yield 0% legitimately; those stay below the
+                                  # threshold and the book gets correctly skipped.
+CROP_ARTIFACT_MIN_NONZERO = 2     # require at least this many non-zero samples to apply
+                                  # the artifact filter; otherwise fall back to all samples
 CROP_BOOK_LR_BACKOFF = 0.03       # subtract from book-level L/R after percentile.
                                   # Detection only finds the body-text edge; running titles,
                                   # page numbers and binding shift can extend closer to the
@@ -570,10 +579,35 @@ def _setup_auto_crop(pdf_path: Path) -> Optional[tuple[float, float, float, floa
         s = sorted(vals)
         return s[int(p / 100 * (len(s) - 1))]
 
-    T = _percentile([f[0] for f in clean], CROP_PERCENTILE)
-    B = _percentile([f[1] for f in clean], CROP_PERCENTILE)
-    L_raw = _percentile([f[2] for f in clean], CROP_PERCENTILE)
-    R_raw = _percentile([f[3] for f in clean], CROP_PERCENTILE)
+    def _percentile_artifact_aware(vals: list[float], p: int,
+                                    label: str) -> tuple[float, bool]:
+        """Percentile with systematic-artifact rejection.
+
+        If a large fraction of samples report ~0% on this side, treat the 0%s
+        as scanner artifacts (a 1-3 row dark band at the page edge from binding
+        shadow or platen edge) and compute the percentile over the non-zero
+        samples only. Manga has occasional full-bleed pages that legitimately
+        return 0%; those stay below the threshold and the book correctly fails
+        the CROP_MIN_MARGIN_FRAC check below.
+
+        Returns (value, filtered_flag).
+        """
+        zeros = sum(1 for v in vals if v < 0.01)
+        non_zero = [v for v in vals if v >= 0.01]
+        if (zeros / len(vals) >= CROP_ARTIFACT_ZERO_FRAC
+                and len(non_zero) >= CROP_ARTIFACT_MIN_NONZERO):
+            print(
+                f"[auto-crop] {label}: dropping {zeros}/{len(vals)} edge-artifact "
+                f"sample(s) before percentile",
+                file=sys.stderr,
+            )
+            return _percentile(non_zero, p), True
+        return _percentile(vals, p), False
+
+    T, _ = _percentile_artifact_aware([f[0] for f in clean], CROP_PERCENTILE, "T")
+    B, _ = _percentile_artifact_aware([f[1] for f in clean], CROP_PERCENTILE, "B")
+    L_raw, _ = _percentile_artifact_aware([f[2] for f in clean], CROP_PERCENTILE, "L")
+    R_raw, _ = _percentile_artifact_aware([f[3] for f in clean], CROP_PERCENTILE, "R")
 
     if min(T, B, L_raw, R_raw) < CROP_MIN_MARGIN_FRAC:
         print(
