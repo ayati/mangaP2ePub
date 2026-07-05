@@ -11,6 +11,7 @@ v0.1 — minimum working pipeline.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import statistics
 import sys
@@ -30,12 +31,23 @@ from pypdf import PdfReader
 VIEWPORT_W = 1103
 VIEWPORT_H = 1600
 JPEG_QUALITY = 78
-GRAYSCALE_DARK_LUM_MAX = 100      # pixels with L <= this count as "ink/line art"
-GRAYSCALE_SAT_THRESHOLD = 20.0    # mean saturation of dark pixels below this -> monochrome
-GRAYSCALE_CHROMA_STD_MAX = 15.0   # std of R-G / G-B channels below this -> monochrome
-                                  # (catches sepia / yellowed paper, where the ink picks up
-                                  # the paper tint and dark-pixel saturation creeps above 20)
 GRAYSCALE_DOWNSCALE_LONG_SIDE = 400
+
+# Color-vs-grayscale classification (see _is_effectively_grayscale)
+COLOR_SAT_FLOOR = 30              # px counts as "colorful" when max(RGB)-min(RGB) > this
+COLOR_MIN_COLORFUL_FRAC = 0.01    # below this colorful-px fraction -> plain B&W scan
+TAN_HUE_CONC_MIN = 0.90           # circular concentration (0..1) of colorful-px hues;
+                                  # aged paper measures >= 0.99, full-color art 0.1-0.85
+TAN_WARM_BAND_LO = 15.0           # degrees; hue band that holds aged-paper tints
+TAN_WARM_BAND_HI = 75.0
+TAN_WARM_MIN_FRAC = 0.90          # colorful px that must fall inside the warm band
+TAN_MEAN_HUE_LO = 20.0            # mean-hue window for aged paper (measured 28-44 deg;
+TAN_MEAN_HUE_HI = 75.0            # red spot-color prints measure ~4-23 deg)
+TAN_SAT_MEAN_MAX = 65.0           # colorful-px mean saturation ceiling; aged paper
+                                  # measured 42-55, vivid spot-color prints >= 72
+SANDWICH_MAX_RUN = 2              # a run of up to this many gray-judged RGB pages
+                                  # bracketed by color pages on both sides is recolored
+                                  # (color sections usually come in contiguous blocks)
 
 # Auto-crop tuning (see _setup_auto_crop)
 CROP_THRESHOLD_OFFSET = 25
@@ -698,19 +710,19 @@ def extract_page_images(pdf_path: Path):
 
 def _is_effectively_grayscale(im: Image.Image) -> bool:
     """
-    Decide whether an RGB image is essentially monochrome.
+    Decide whether an image is essentially monochrome — either a plain B&W
+    scan or B&W content on age-tanned ("yaketa") paper whose tint should be
+    stripped.
 
-    Two complementary tests; either is sufficient:
-
-      1. Hue uniformity. The std of per-pixel R-G and G-B is small for a page
-         with a single dominant hue (white, sepia, or any other uniformly
-         tinted paper) and large for multi-color illustrations. This catches
-         yellowed / age-tanned paper where the ink absorbs some paper tint
-         and the dark-pixel saturation creeps above the threshold below.
-      2. Dark-pixel saturation. Mean saturation (max RGB - min RGB) over dark
-         pixels only. Stays low for B&W line-art even on noisy scans where the
-         hue-uniformity test fails because the paper itself has scan-induced
-         color variation.
+      1. Pages with almost no saturated pixels are plain B&W scans.
+      2. Otherwise, look at the hue distribution of the saturated pixels.
+         Age-tanning is physically always a warm yellow-orange tint: hue
+         tightly concentrated inside 20-75 deg at moderate saturation.
+         Anything else is real color and must be preserved:
+           - cool / non-warm dominant hue (blue covers, pink section pages,
+             green or red spot-color printing),
+           - dispersed hues (full-color artwork, even when pale),
+           - vivid saturation (solid-color endpapers, orange cover art).
     """
     if im.mode in ("L", "1"):
         return True
@@ -723,31 +735,43 @@ def _is_effectively_grayscale(im: Image.Image) -> bool:
             Image.NEAREST,
         )
     r, g, b = im.split()
-
-    # Test 1: chroma std. Offset 128 lets us measure signed differences via
-    # an unsigned subtract; |R-G| > 127 is rare in scanned book pages and
-    # would only clamp at extremes that already register as colorful.
-    rg = ImageChops.subtract(r, g, scale=1, offset=128)
-    gb = ImageChops.subtract(g, b, scale=1, offset=128)
-    chroma_std = max(
-        ImageStat.Stat(rg).stddev[0],
-        ImageStat.Stat(gb).stddev[0],
-    )
-    if chroma_std < GRAYSCALE_CHROMA_STD_MAX:
-        return True
-
-    # Test 2: dark-pixel saturation.
     hi = ImageChops.lighter(ImageChops.lighter(r, g), b)
     lo = ImageChops.darker(ImageChops.darker(r, g), b)
     sat = ImageChops.difference(hi, lo)
-    lum = im.convert("L")
-    dark_mask = lum.point(
-        lambda v: 255 if v <= GRAYSCALE_DARK_LUM_MAX else 0, mode="L"
+    colorful_mask = sat.point(
+        lambda v: 255 if v > COLOR_SAT_FLOOR else 0, mode="L"
     )
-    if dark_mask.getextrema() == (0, 0):
-        # No dark pixels — page is blank-ish; grayscale is safe.
+    colorful_frac = ImageStat.Stat(colorful_mask).mean[0] / 255.0
+    if colorful_frac < COLOR_MIN_COLORFUL_FRAC:
         return True
-    return ImageStat.Stat(sat, mask=dark_mask).mean[0] < GRAYSCALE_SAT_THRESHOLD
+
+    # Circular hue statistics over the colorful pixels, computed from the
+    # HSV hue-channel histogram (256 bins for 360 deg) so everything stays
+    # in C-level PIL ops.
+    hue_hist = im.convert("HSV").split()[0].histogram(mask=colorful_mask)
+    total = sum(hue_hist)
+    if total == 0:
+        return True
+    warm_lo = TAN_WARM_BAND_LO / 360.0 * 256.0
+    warm_hi = TAN_WARM_BAND_HI / 360.0 * 256.0
+    cos_sum = sin_sum = 0.0
+    warm = 0
+    for i, cnt in enumerate(hue_hist):
+        if not cnt:
+            continue
+        ang = i * (2.0 * math.pi / 256.0)
+        cos_sum += cnt * math.cos(ang)
+        sin_sum += cnt * math.sin(ang)
+        if warm_lo <= i <= warm_hi:
+            warm += cnt
+    conc = math.hypot(cos_sum / total, sin_sum / total)
+    mean_hue = math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
+    warm_frac = warm / total
+    sat_mean = ImageStat.Stat(sat, mask=colorful_mask).mean[0]
+    return (conc >= TAN_HUE_CONC_MIN
+            and warm_frac >= TAN_WARM_MIN_FRAC
+            and TAN_MEAN_HUE_LO <= mean_hue <= TAN_MEAN_HUE_HI
+            and sat_mean <= TAN_SAT_MEAN_MAX)
 
 
 def normalize_to_viewport(img_bytes: bytes,
@@ -755,12 +779,17 @@ def normalize_to_viewport(img_bytes: bytes,
                           target_h: int = VIEWPORT_H,
                           quality: int = JPEG_QUALITY,
                           crop_box: Optional[tuple[float, float, float, float]] = None,
-                          crop_stats: Optional[dict] = None) -> bytes:
+                          crop_stats: Optional[dict] = None,
+                          is_gray: Optional[bool] = None) -> bytes:
     """Fit-resize into target_w x target_h, letterboxing with white.
 
     RGB images that are essentially monochrome (B&W manga interiors, even
     with sepia paper tone) are auto-converted to L mode for smaller files
     with no perceptible quality loss.
+
+    is_gray: pass the page's precomputed color class to override the
+    per-image detection (build_epub decides book-wide: cover forced to
+    color, sandwich rule). None = detect here.
 
     crop_box: optional (T, B, L, R) fractional margins (0..1) to strip from
     each side before fitting. Applied per-page using the page's own
@@ -791,7 +820,8 @@ def normalize_to_viewport(img_bytes: bytes,
     if im.mode not in ("L", "RGB"):
         im = im.convert("RGB")
 
-    is_gray = im.mode == "L" or _is_effectively_grayscale(im)
+    if is_gray is None:
+        is_gray = im.mode == "L" or _is_effectively_grayscale(im)
 
     apply_crop = False
     page_margins: Optional[tuple[float, float, float, float]] = None
@@ -884,15 +914,77 @@ def build_epub(pdf_path: Path,
         if crop_box is not None else None
     )
 
-    # 1. Gather all page images into memory, normalized.
-    print(f"[info] extracting & normalizing pages from {pdf_path.name}", file=sys.stderr)
-    page_blobs: list[tuple[str, str, bytes]] = []
-    # each entry: (image_id, image_filename, jpeg_bytes)
+    # 1a. Extract (and possibly rotate) every page, keeping raw JPEG bytes.
+    print(f"[info] extracting pages from {pdf_path.name}", file=sys.stderr)
+    raw_pages: list[bytes] = []
     for i, raw, _ext in extract_page_images(pdf_path):
         if rotate_ctx is not None:
             raw = _maybe_rotate_page(raw, i, rotate_ctx, quality=quality)
+        raw_pages.append(raw)
+
+    # 1b. Classify every page color/gray up front so the decision can use
+    #     the whole book, not just the page itself:
+    #       - the cover (page 1) is never grayscaled;
+    #       - a short gray-judged run bracketed by color pages is recolored
+    #         (color sections are printed in contiguous blocks, so a lone
+    #         "gray" page between color pages is almost always a detection
+    #         miss on a pale color page).
+    #     draft() decodes JPEGs at reduced scale — the classifier downscales
+    #     to GRAYSCALE_DOWNSCALE_LONG_SIDE anyway, so this pass stays cheap.
+    gray_flags: list[bool] = []
+    rgb_source: list[bool] = []
+    for raw in raw_pages:
+        try:
+            im = Image.open(BytesIO(raw))
+            im.draft(None, (GRAYSCALE_DOWNSCALE_LONG_SIDE,
+                            GRAYSCALE_DOWNSCALE_LONG_SIDE))
+            rgb_source.append(im.mode not in ("L", "1"))
+            gray_flags.append(_is_effectively_grayscale(im))
+        except Exception:
+            rgb_source.append(False)
+            gray_flags.append(True)
+
+    cover_forced = False
+    if gray_flags and gray_flags[0] and rgb_source[0]:
+        gray_flags[0] = False
+        cover_forced = True
+
+    sandwich_pages: list[int] = []
+    j = 1
+    while j < len(gray_flags) - 1:
+        if not gray_flags[j]:
+            j += 1
+            continue
+        k = j
+        while k < len(gray_flags) and gray_flags[k]:
+            k += 1
+        if (k - j <= SANDWICH_MAX_RUN and k < len(gray_flags)
+                and not gray_flags[j - 1]
+                and all(rgb_source[j:k])):
+            for t in range(j, k):
+                gray_flags[t] = False
+                sandwich_pages.append(t)
+        j = k
+
+    n_color = sum(1 for f in gray_flags if not f)
+    notes = []
+    if cover_forced:
+        notes.append("cover forced to color")
+    if sandwich_pages:
+        notes.append(f"sandwich rule recolored page(s) "
+                     f"{[p + 1 for p in sandwich_pages]}")
+    print(f"[color-detect] {n_color}/{len(gray_flags)} page(s) kept in color"
+          + (f" ({'; '.join(notes)})" if notes else ""), file=sys.stderr)
+
+    # 2. Normalize every page into the viewport.
+    print("[info] normalizing pages", file=sys.stderr)
+    page_blobs: list[tuple[str, str, bytes]] = []
+    # each entry: (image_id, image_filename, jpeg_bytes)
+    for i, raw in enumerate(raw_pages):
         jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality,
-                                    crop_box=crop_box, crop_stats=crop_stats)
+                                    crop_box=crop_box, crop_stats=crop_stats,
+                                    is_gray=gray_flags[i])
+        raw_pages[i] = b""  # free the raw page as we go
         if i == 0:
             image_id = "cover"
             image_name = "cover.jpg"
@@ -924,7 +1016,7 @@ def build_epub(pdf_path: Path,
 
     last_body_idx = total - 1
 
-    # 2. Compose OPF parts.
+    # 3. Compose OPF parts.
     image_items_lines = []
     page_items_lines = []
     spine_lines = []
@@ -969,7 +1061,7 @@ def build_epub(pdf_path: Path,
         direction=direction,
     )
 
-    # 3. Compose nav + ncx (3 TOC entries: 表紙 / 本編 / 奥付).
+    # 4. Compose nav + ncx (3 TOC entries: 表紙 / 本編 / 奥付).
     if total >= 3:
         toc = [
             ("表紙", "xhtml/p-cover.xhtml"),
@@ -997,7 +1089,7 @@ def build_epub(pdf_path: Path,
     )
     ncx_xml = NCX_TMPL.format(uid=uid, title=xml_escape(title), nav_points=nav_points)
 
-    # 4. Compose per-page XHTML.
+    # 5. Compose per-page XHTML.
     page_xhtmls: list[tuple[str, str]] = []
     for idx, (_image_id, image_name, _blob) in enumerate(page_blobs):
         page_id = "p-cover" if idx == 0 else f"p-{idx:03d}"
@@ -1008,7 +1100,7 @@ def build_epub(pdf_path: Path,
         )
         page_xhtmls.append((page_id, xhtml))
 
-    # 5. Write the ZIP (mimetype STORED first, everything else DEFLATED).
+    # 6. Write the ZIP (mimetype STORED first, everything else DEFLATED).
     print(f"[info] writing {out_path}", file=sys.stderr)
     with zipfile.ZipFile(out_path, "w") as z:
         zi = zipfile.ZipInfo("mimetype")
