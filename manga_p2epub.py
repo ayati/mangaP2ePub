@@ -5,7 +5,7 @@ manga_p2epub.py — Convert a scanned-book PDF into a fixed-layout (manga) EPUB3
 Input:  one PDF per book, each page holds a single embedded scan image.
 Output: EBPAJ 1.1.2 style pre-paginated EPUB with 1103x1600 viewport.
 
-v0.1 — minimum working pipeline.
+v0.2 — adds an invisible OCR text layer (search / select / copy).
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ from typing import Optional
 
 from PIL import Image, ImageChops, ImageFilter, ImageStat
 from pypdf import PdfReader
+
+try:
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LAParams, LTChar, LTTextContainer, LTTextLine
+    HAS_PDFMINER = True
+except ImportError:
+    HAS_PDFMINER = False
 
 
 # ---------- Constants ----------
@@ -81,6 +88,21 @@ CROP_BOOK_LR_MAX = 0.05           # hard ceiling on the book-level L/R crop frac
                                   # keeps a comfortable margin even on books whose detection
                                   # reports very wide L/R, at the cost of leaving a bit of
                                   # paper on each side. Vertical (T/B) crop is not capped.
+# Invisible OCR text layer (see _extract_text_lines / _svg_text_layer).
+# Scanner OCR text is copied into each page's SVG as transparent <text>
+# elements so readers can search / select / copy. Play Books, Thorium and
+# calibre honor it; Send to Kindle's conversion drops it (verified 2026-07).
+TEXT_GOOD_RATIO_MIN = 0.70        # keep a line when at least this fraction of
+                                  # its chars are kana/kanji/alnum/punctuation.
+                                  # Filters screen-tone garbage on manga pages
+                                  # (measured: drops cover noise like "■■" and
+                                  # "�" while keeping 100% of novel body text).
+                                  # Halfwidth katakana (U+FF61-FF9F) counts as
+                                  # garbage: vertical novels never use it, and
+                                  # OCR emits it mostly on misreads.
+TEXT_BASELINE_RAISE = 0.15        # baseline sits this fraction above the char
+                                  # bbox bottom (glyph descent approximation)
+
 CROP_BOOK_LR_BACKOFF = 0.03       # subtract from book-level L/R after percentile.
                                   # Detection only finds the body-text edge; running titles,
                                   # page numbers and binding shift can extend closer to the
@@ -122,7 +144,7 @@ PAGE_XHTML_TMPL = """\
 <div class="main">
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="100%" height="100%" viewBox="0 0 {vw} {vh}">
 <image width="{vw}" height="{vh}" xlink:href="../image/{image_name}"/>
-</svg>
+{text_layer}</svg>
 </div>
 </body>
 </html>
@@ -195,7 +217,7 @@ OPF_TMPL = """\
 {image_items}
 {page_items}
 </manifest>
-<spine page-progression-direction="{direction}">
+<spine toc="ncx" page-progression-direction="{direction}">
 {spine_items}
 </spine>
 </package>
@@ -420,6 +442,8 @@ def _setup_auto_rotate(pdf_path: Path) -> Optional[dict]:
         "ph_med": ph_med,
         "convention_samples": [],
         "convention": None,
+        "rotated": set(),   # page idxs actually rotated (their OCR coords no
+                            # longer match the image; text layer skips them)
     }
 
 
@@ -468,6 +492,7 @@ def _maybe_rotate_page(raw_bytes: bytes, idx: int, ctx: dict,
         f"{rotated.width}x{rotated.height} ({label})",
         file=sys.stderr,
     )
+    ctx["rotated"].add(idx)
     return buf.getvalue()
 
 
@@ -650,6 +675,134 @@ def _setup_auto_crop(pdf_path: Path) -> Optional[tuple[float, float, float, floa
     return (T, B, L, R)
 
 
+# ---------- Invisible OCR text layer ----------
+#
+# Document scanners (ScanSnap etc.) embed an invisible OCR text layer in the
+# PDF. _extract_text_lines() recovers it with per-character coordinates via
+# pdfminer.six; _svg_text_layer() re-emits it as transparent SVG <text>
+# elements over the page image, so the EPUB stays searchable and the text can
+# be selected/copied at its position on the scan. This mirrors the DPFJ
+# fixed-layout template's own pattern of invisible overlay elements inside
+# the image SVG (its link areas are <a><rect fill-opacity="0.0"/></a>).
+#
+# Skipped per page when the page image was rotated (either /Rotate or the
+# misscan auto-rotate): the OCR coordinates no longer match the emitted image
+# and sideways scans carry garbage OCR anyway.
+
+def _is_good_char(ch: str) -> bool:
+    """True for characters plausible in Japanese book text (not OCR noise)."""
+    cp = ord(ch)
+    if 0x3040 <= cp <= 0x30FF:      # hiragana + katakana
+        return True
+    if 0x31F0 <= cp <= 0x31FF:      # katakana phonetic extensions
+        return True
+    if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:  # kanji
+        return True
+    if 0x3000 <= cp <= 0x303F:      # CJK punctuation 、。「」『』etc.
+        return True
+    if 0xFF01 <= cp <= 0xFF5E:      # fullwidth alphanumerics / punctuation
+        return True
+    if ch.isascii() and (ch.isalnum() or ch in " .,!?()-'\":;/"):
+        return True
+    return ch in "ー・…‥〜~※"
+
+
+def _line_quality(text: str) -> float:
+    t = text.strip()
+    if not t:
+        return 0.0
+    return sum(1 for c in t if _is_good_char(c)) / len(t)
+
+
+def _extract_text_lines(pdf_path: Path) -> dict[int, dict]:
+    """Extract the OCR text layer for every page in one pdfminer pass.
+
+    Returns {page_idx: {"pw": pt, "ph": pt, "lines": [line, ...]}} where each
+    line is {"chars": [(ch, x0, y0, x1, y1, size), ...]} in PDF user space
+    (origin bottom-left, points). Garbage lines are dropped by _line_quality;
+    survivors are sorted in Japanese reading order (vertical columns
+    right-to-left first, then horizontal lines top-to-bottom) so multi-line
+    selection and search cross line boundaries in the right order.
+    """
+    pages: dict[int, dict] = {}
+    kept_total = dropped_total = 0
+    laparams = LAParams(detect_vertical=True)
+    for pidx, pl in enumerate(extract_pages(str(pdf_path), laparams=laparams)):
+        lines = []
+        for el in pl:
+            if not isinstance(el, LTTextContainer):
+                continue
+            for line in el:
+                if not isinstance(line, LTTextLine):
+                    continue
+                chars = [c for c in line if isinstance(c, LTChar)]
+                if not chars:
+                    continue
+                text = "".join(c.get_text() for c in chars)
+                if _line_quality(text) < TEXT_GOOD_RATIO_MIN:
+                    dropped_total += 1
+                    continue
+                # Single-char lines that aren't alphanumeric (page numbers)
+                # are almost always tone/artwork misreads ("リ", "、", "』");
+                # a real vertical text column is tens of chars long.
+                t = text.strip()
+                if len(t) == 1 and not t.isalnum():
+                    dropped_total += 1
+                    continue
+                vertical = sum(1 for c in chars if not c.upright) > len(chars) / 2
+                lines.append({
+                    "vertical": vertical,
+                    "x1": line.x1, "y1": line.y1,
+                    "chars": [(c.get_text(), c.x0, c.y0, c.x1, c.y1, c.size)
+                              for c in chars],
+                })
+        lines.sort(key=lambda L: (not L["vertical"],
+                                  -L["x1"] if L["vertical"] else -L["y1"]))
+        kept_total += len(lines)
+        pages[pidx] = {"pw": pl.width, "ph": pl.height, "lines": lines}
+    print(f"[text-layer] kept {kept_total} line(s), "
+          f"dropped {dropped_total} garbage line(s) "
+          f"across {len(pages)} page(s)", file=sys.stderr)
+    return pages
+
+
+def _svg_text_layer(page_text: Optional[dict],
+                    xform: tuple[int, int, int, int, float, int, int]) -> str:
+    """Build transparent SVG <text> elements for one page.
+
+    xform is normalize_to_viewport's (img_w, img_h, crop_l, crop_t, scale,
+    ox, oy): PDF-space fractions are mapped onto the pre-crop image pixels,
+    shifted by the crop origin, scaled, then letterbox-offset. One <text>
+    per OCR line with per-glyph x/y lists keeps character positions exact
+    for both vertical and horizontal lines.
+    """
+    if not page_text or not page_text["lines"]:
+        return ""
+    pw, ph = page_text["pw"], page_text["ph"]
+    img_w, img_h, crop_l, crop_t, scale, ox, oy = xform
+
+    def mx(x: float) -> float:
+        return ox + (x / pw * img_w - crop_l) * scale
+
+    def my(y: float) -> float:
+        return oy + ((1.0 - y / ph) * img_h - crop_t) * scale
+
+    out = []
+    for L in page_text["lines"]:
+        sizes = sorted(c[5] for c in L["chars"])
+        fs = sizes[len(sizes) // 2] / ph * img_h * scale
+        xs, ys, glyphs = [], [], []
+        for ch, x0, y0, x1, y1, _size in L["chars"]:
+            xs.append(f"{mx(x0):.1f}")
+            ys.append(f"{my(y0 + TEXT_BASELINE_RAISE * (y1 - y0)):.1f}")
+            glyphs.append(xml_escape(ch))
+        out.append(
+            f'<text fill="#000" fill-opacity="0" font-size="{fs:.1f}" '
+            f'x="{" ".join(xs)}" y="{" ".join(ys)}">{"".join(glyphs)}</text>'
+        )
+    return "\n".join(out) + "\n"
+
+
 # ---------- Image extraction & normalization ----------
 
 def _encode_jpeg(im: Image.Image, quality: int = JPEG_QUALITY) -> bytes:
@@ -780,8 +933,15 @@ def normalize_to_viewport(img_bytes: bytes,
                           quality: int = JPEG_QUALITY,
                           crop_box: Optional[tuple[float, float, float, float]] = None,
                           crop_stats: Optional[dict] = None,
-                          is_gray: Optional[bool] = None) -> bytes:
+                          is_gray: Optional[bool] = None
+                          ) -> tuple[bytes, tuple[int, int, int, int, float, int, int]]:
     """Fit-resize into target_w x target_h, letterboxing with white.
+
+    Returns (jpeg_bytes, xform) where xform = (img_w, img_h, crop_l, crop_t,
+    scale, ox, oy) describes how a pixel of the decoded source image landed
+    on the viewport: img_w/img_h are the pre-crop dimensions, crop_l/crop_t
+    the crop origin in source pixels, scale the resize ratio, ox/oy the
+    letterbox offset. _svg_text_layer() uses this to map OCR coordinates.
 
     RGB images that are essentially monochrome (B&W manga interiors, even
     with sepia paper tone) are auto-converted to L mode for smaller files
@@ -819,6 +979,8 @@ def normalize_to_viewport(img_bytes: bytes,
     im = Image.open(BytesIO(img_bytes))
     if im.mode not in ("L", "RGB"):
         im = im.convert("RGB")
+    src_w, src_h = im.size
+    crop_l = crop_t = 0
 
     if is_gray is None:
         is_gray = im.mode == "L" or _is_effectively_grayscale(im)
@@ -865,6 +1027,7 @@ def normalize_to_viewport(img_bytes: bytes,
         right_px = W - int(R * W)
         if right_px > left_px and bot_px > top_px:
             im = im.crop((left_px, top_px, right_px, bot_px))
+            crop_l, crop_t = left_px, top_px
     if im.mode == "RGB" and is_gray:
         im = im.convert("L")
     if (im.width, im.height) == (target_w, target_h):
@@ -872,16 +1035,17 @@ def normalize_to_viewport(img_bytes: bytes,
         # readers don't trip over unusual JPEG variants.
         buf = BytesIO()
         im.save(buf, "JPEG", quality=quality, optimize=True)
-        return buf.getvalue()
+        return buf.getvalue(), (src_w, src_h, crop_l, crop_t, 1.0, 0, 0)
     ratio = min(target_w / im.width, target_h / im.height)
     nw, nh = max(1, int(round(im.width * ratio))), max(1, int(round(im.height * ratio)))
     resized = im.resize((nw, nh), Image.LANCZOS)
     bg = 255 if im.mode == "L" else (255, 255, 255)
     canvas = Image.new(im.mode, (target_w, target_h), bg)
-    canvas.paste(resized, ((target_w - nw) // 2, (target_h - nh) // 2))
+    ox, oy = (target_w - nw) // 2, (target_h - nh) // 2
+    canvas.paste(resized, (ox, oy))
     buf = BytesIO()
     canvas.save(buf, "JPEG", quality=quality, optimize=True)
-    return buf.getvalue()
+    return buf.getvalue(), (src_w, src_h, crop_l, crop_t, ratio, ox, oy)
 
 
 # ---------- XML helpers ----------
@@ -903,12 +1067,33 @@ def build_epub(pdf_path: Path,
                direction: str = "rtl",
                quality: int = JPEG_QUALITY,
                auto_rotate: bool = True,
-               auto_crop: bool = True) -> None:
+               auto_crop: bool = True,
+               embed_text: bool = True) -> None:
     uid = str(uuid.uuid4())
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     rotate_ctx = _setup_auto_rotate(pdf_path) if auto_rotate else None
     crop_box = _setup_auto_crop(pdf_path) if auto_crop else None
+
+    text_pages: dict[int, dict] = {}
+    if embed_text:
+        if HAS_PDFMINER:
+            print("[text-layer] extracting OCR text", file=sys.stderr)
+            try:
+                text_pages = _extract_text_lines(pdf_path)
+            except Exception as e:
+                print(f"[text-layer] extraction failed, continuing without "
+                      f"text ({e})", file=sys.stderr)
+        else:
+            print("[text-layer] pdfminer.six not installed — "
+                  "no searchable text (pip install pdfminer.six)",
+                  file=sys.stderr)
+
+    # Pages whose image was rotated away from the OCR coordinate space.
+    pdf_rotated: set[int] = set()
+    if text_pages:
+        reader = PdfReader(str(pdf_path))
+        pdf_rotated = {i for i, p in enumerate(reader.pages) if _page_rotation(p)}
     crop_stats = (
         {"applied": 0, "skipped_color": 0, "skipped_tight": 0}
         if crop_box is not None else None
@@ -980,10 +1165,12 @@ def build_epub(pdf_path: Path,
     print("[info] normalizing pages", file=sys.stderr)
     page_blobs: list[tuple[str, str, bytes]] = []
     # each entry: (image_id, image_filename, jpeg_bytes)
+    xforms: list[tuple[int, int, int, int, float, int, int]] = []
     for i, raw in enumerate(raw_pages):
-        jpg = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality,
-                                    crop_box=crop_box, crop_stats=crop_stats,
-                                    is_gray=gray_flags[i])
+        jpg, xform = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality,
+                                           crop_box=crop_box, crop_stats=crop_stats,
+                                           is_gray=gray_flags[i])
+        xforms.append(xform)
         raw_pages[i] = b""  # free the raw page as we go
         if i == 0:
             image_id = "cover"
@@ -1087,18 +1274,31 @@ def build_epub(pdf_path: Path,
         f'<content src="{href}"/></navPoint>'
         for i, (label, href) in enumerate(toc)
     )
-    ncx_xml = NCX_TMPL.format(uid=uid, title=xml_escape(title), nav_points=nav_points)
+    ncx_xml = NCX_TMPL.format(uid=f"urn:uuid:{uid}", title=xml_escape(title),
+                              nav_points=nav_points)
 
-    # 5. Compose per-page XHTML.
+    # 5. Compose per-page XHTML (with the invisible OCR text layer when the
+    #    page kept its original orientation).
+    rotated_pages = pdf_rotated | (rotate_ctx["rotated"] if rotate_ctx else set())
+    text_page_count = 0
     page_xhtmls: list[tuple[str, str]] = []
     for idx, (_image_id, image_name, _blob) in enumerate(page_blobs):
         page_id = "p-cover" if idx == 0 else f"p-{idx:03d}"
+        text_layer = ""
+        if text_pages and idx not in rotated_pages:
+            text_layer = _svg_text_layer(text_pages.get(idx), xforms[idx])
+            if text_layer:
+                text_page_count += 1
         xhtml = PAGE_XHTML_TMPL.format(
             title=xml_escape(title),
             vw=VIEWPORT_W, vh=VIEWPORT_H,
             image_name=image_name,
+            text_layer=text_layer,
         )
         page_xhtmls.append((page_id, xhtml))
+    if text_pages:
+        print(f"[text-layer] embedded on {text_page_count}/{total} page(s)",
+              file=sys.stderr)
 
     # 6. Write the ZIP (mimetype STORED first, everything else DEFLATED).
     print(f"[info] writing {out_path}", file=sys.stderr)
@@ -1155,6 +1355,12 @@ def main(argv: list[str] | None = None) -> int:
                          "(default: enabled — uniform fractional crop is "
                          "applied when all 4 sides have detected margin ≥ 3%; "
                          "manga and bleed pages are skipped automatically)")
+    ap.add_argument("--no-text", action="store_true",
+                    help="disable the invisible OCR text layer "
+                         "(default: enabled — the PDF's scanner-OCR text is "
+                         "embedded as transparent SVG text so the EPUB is "
+                         "searchable and text can be selected/copied; "
+                         "requires pdfminer.six)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing output file")
     args = ap.parse_args(argv)
@@ -1187,7 +1393,8 @@ def main(argv: list[str] | None = None) -> int:
         build_epub(pdf_path, out_path, title, author,
                    direction=args.direction, quality=args.quality,
                    auto_rotate=not args.no_auto_rotate,
-                   auto_crop=not args.no_auto_crop)
+                   auto_crop=not args.no_auto_crop,
+                   embed_text=not args.no_text)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
