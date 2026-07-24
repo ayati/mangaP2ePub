@@ -198,9 +198,9 @@ OPF_TMPL = """\
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" xml:lang="ja" unique-identifier="bookid" prefix="rendition: http://www.idpf.org/vocab/rendition/# ebpaj: http://www.ebpaj.jp/ fixed-layout-jp: http://www.digital-comic.jp/">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
 <dc:title>{title}</dc:title>
-<dc:creator>{author}</dc:creator>
+{creators_meta}
 <dc:language>ja</dc:language>
-<dc:identifier id="bookid">urn:uuid:{uid}</dc:identifier>
+<dc:identifier id="bookid">urn:uuid:{uid}</dc:identifier>{publisher_meta}{date_meta}{source_meta}
 <meta property="dcterms:modified">{modified}</meta>
 <meta property="rendition:layout">pre-paginated</meta>
 <meta property="rendition:spread">landscape</meta>
@@ -242,6 +242,33 @@ def parse_meta_from_filename(pdf_path: Path) -> tuple[str, Optional[str]]:
             if title and author:
                 return title, author
     return stem.strip(), None
+
+
+def build_bib_meta(author: str, artist: Optional[str], publisher: Optional[str],
+                   isbn: Optional[str], pub_date: Optional[str]) -> tuple[str, str, str, str]:
+    """OPF metadata の書誌ブロックを組み立てる（yomikake v2.10.0 連携）。
+    戻り値 (creators_meta, publisher_meta, date_meta, source_meta)。
+    原作は role=aut、作画(artist)は role=art。yomikake が役割別に表示する。
+    """
+    entries: list[tuple[str, str]] = []
+    if author:
+        entries.append((author, "aut"))
+    if artist:
+        entries.append((artist, "art"))
+    if not entries:
+        entries.append(("unknown", "aut"))
+    clines: list[str] = []
+    for i, (name, role) in enumerate(entries, 1):
+        cid = f"creator{i:02d}"
+        clines.append(f'<dc:creator id="{cid}">{xml_escape(name)}</dc:creator>')
+        clines.append(f'<meta refines="#{cid}" property="role" scheme="marc:relators">{role}</meta>')
+        clines.append(f'<meta refines="#{cid}" property="display-seq">{i}</meta>')
+    creators_meta = "\n".join(clines)
+    publisher_meta = f'\n<dc:publisher>{xml_escape(publisher)}</dc:publisher>' if publisher else ""
+    date_meta = f'\n<dc:date>{xml_escape(pub_date)}</dc:date>' if pub_date else ""
+    _isbn = re.sub(r"[-\s]", "", isbn) if isbn else ""
+    source_meta = f'\n<dc:source>urn:isbn:{_isbn}</dc:source>' if _isbn else ""
+    return creators_meta, publisher_meta, date_meta, source_meta
 
 
 def sanitize_filename(name: str) -> str:
@@ -1068,7 +1095,11 @@ def build_epub(pdf_path: Path,
                quality: int = JPEG_QUALITY,
                auto_rotate: bool = True,
                auto_crop: bool = True,
-               embed_text: bool = True) -> None:
+               embed_text: bool = True,
+               artist: Optional[str] = None,      # 作画 → dc:creator role=art
+               publisher: Optional[str] = None,   # 原出版社 → dc:publisher
+               isbn: Optional[str] = None,        # 底本 ISBN → dc:source urn:isbn
+               pub_date: Optional[str] = None) -> None:  # 原刊行日 → dc:date
     uid = str(uuid.uuid4())
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1235,9 +1266,14 @@ def build_epub(pdf_path: Path,
             f'<itemref idref="{page_id}" linear="yes" properties="{spread}"/>'
         )
 
+    creators_meta, publisher_meta, date_meta, source_meta = build_bib_meta(
+        author, artist, publisher, isbn, pub_date)
     opf_xml = OPF_TMPL.format(
         title=xml_escape(title),
-        author=xml_escape(author),
+        creators_meta=creators_meta,
+        publisher_meta=publisher_meta,
+        date_meta=date_meta,
+        source_meta=source_meta,
         uid=uid,
         modified=modified,
         vw=VIEWPORT_W,
@@ -1340,7 +1376,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--title", default=None,
                     help="override title (default: parsed from filename)")
     ap.add_argument("--author", default=None,
-                    help="override author (default: parsed from filename)")
+                    help="override author / 原作 (default: parsed from filename); dc:creator role=aut")
+    ap.add_argument("--artist", default=None,
+                    help="作画 (illustrator); adds a second dc:creator with role=art")
+    ap.add_argument("--publisher", default=None,
+                    help="原出版社 -> dc:publisher (shown as the publisher in the yomikake viewer)")
+    ap.add_argument("--isbn", default=None,
+                    help="底本の ISBN -> dc:source urn:isbn (hyphens allowed; used for bibliographic search)")
+    ap.add_argument("--date", default=None,
+                    help="原刊行日 -> dc:date (e.g. 2016-03-03)")
     ap.add_argument("--direction", choices=("rtl", "ltr"), default="rtl",
                     help="page progression (default: rtl)")
     ap.add_argument("--quality", type=int, default=JPEG_QUALITY,
@@ -1382,6 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
     a_src = "option" if args.author else ("filename" if parsed_author else "default")
     print(f"[info] title=\"{title}\" (from {t_src}), "
           f"author=\"{author}\" (from {a_src})", file=sys.stderr)
+    if args.artist:
+        print(f"[info] artist=\"{args.artist}\" (作画)", file=sys.stderr)
 
     out_path: Path = args.output or default_output_path(pdf_path, title, author if args.author or parsed_author else None)
     if out_path.exists() and not args.force:
@@ -1394,7 +1440,9 @@ def main(argv: list[str] | None = None) -> int:
                    direction=args.direction, quality=args.quality,
                    auto_rotate=not args.no_auto_rotate,
                    auto_crop=not args.no_auto_crop,
-                   embed_text=not args.no_text)
+                   embed_text=not args.no_text,
+                   artist=args.artist, publisher=args.publisher,
+                   isbn=args.isbn, pub_date=args.date)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1

@@ -64,7 +64,11 @@ python3 manga_p2epub.py scan.pdf \
 | `pdf` (位置引数) | — | 入力 PDF（必須） |
 | `-o`, `--output` | `<title>_<author>.epub` | 出力 EPUB パス |
 | `--title` | ファイル名から抽出 | 題名を明示指定（ファイル名優先解決を上書き） |
-| `--author` | ファイル名から抽出 | 作者を明示指定 |
+| `--author` | ファイル名から抽出 | 作者（原作）を明示指定。`dc:creator` role=aut |
+| `--artist` | なし | 作画（絵）。2人目の `dc:creator` を role=art で追加。原作と作画が別の作品向け |
+| `--publisher` | なし | 原出版社。`dc:publisher` に記録し、yomikake ビューアの書誌ブロック「出版社」欄に表示 |
+| `--isbn` | なし | 底本の ISBN。`dc:source`（`urn:isbn:…`）に記録し、yomikake が国立国会図書館サーチ等の書誌検索リンクに使う（ハイフン可・自動除去） |
+| `--date` | なし | 原刊行日。`dc:date` に記録（例 `2016-03-03`） |
 | `--direction` | `rtl` | ページ送り方向（`rtl` または `ltr`） |
 | `--quality` | `78` | JPEG 品質（1–95）。上げれば高品質・大容量、下げれば軽量化 |
 | `--no-auto-rotate` | オフ | 横長ページの自動回転を無効化（既定では有効） |
