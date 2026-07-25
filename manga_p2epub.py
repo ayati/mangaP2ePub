@@ -5,7 +5,10 @@ manga_p2epub.py — Convert a scanned-book PDF into a fixed-layout (manga) EPUB3
 Input:  one PDF per book, each page holds a single embedded scan image.
 Output: EBPAJ 1.1.2 style pre-paginated EPUB with 1103x1600 viewport.
 
-v0.2 — adds an invisible OCR text layer (search / select / copy).
+v1.0.0 — invisible OCR text layer (search / select / copy), ISBN normalization
+and colophon auto-detection, NDL (国立国会図書館サーチ) bibliographic enrichment
+(readings / roles / date / publisher / series), publication-date detection, and
+accessibility metadata.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import math
 import re
 import statistics
 import sys
+import unicodedata
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -31,6 +35,8 @@ try:
     HAS_PDFMINER = True
 except ImportError:
     HAS_PDFMINER = False
+
+__version__ = "1.0.0"
 
 
 # ---------- Constants ----------
@@ -195,14 +201,14 @@ NCX_TMPL = """\
 
 OPF_TMPL = """\
 <?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" xml:lang="ja" unique-identifier="bookid" prefix="rendition: http://www.idpf.org/vocab/rendition/# ebpaj: http://www.ebpaj.jp/ fixed-layout-jp: http://www.digital-comic.jp/">
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" xml:lang="ja" unique-identifier="bookid" prefix="rendition: http://www.idpf.org/vocab/rendition/# ebpaj: http://www.ebpaj.jp/ fixed-layout-jp: http://www.digital-comic.jp/ schema: http://schema.org/ dcndl: http://ndl.go.jp/dcndl/terms/">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-<dc:title>{title}</dc:title>
+{title_meta}
 {creators_meta}
 <dc:language>ja</dc:language>
-<dc:identifier id="bookid">urn:uuid:{uid}</dc:identifier>{publisher_meta}{date_meta}{source_meta}
+<dc:identifier id="bookid">urn:uuid:{uid}</dc:identifier>{publisher_meta}{date_meta}{source_meta}{description_meta}{subject_meta}{series_meta}
 <meta property="dcterms:modified">{modified}</meta>
-<meta property="rendition:layout">pre-paginated</meta>
+{access_meta}<meta property="rendition:layout">pre-paginated</meta>
 <meta property="rendition:spread">landscape</meta>
 <meta property="rendition:orientation">auto</meta>
 <meta property="ebpaj:guide-version">1.1.2</meta>
@@ -244,31 +250,470 @@ def parse_meta_from_filename(pdf_path: Path) -> tuple[str, Optional[str]]:
     return stem.strip(), None
 
 
-def build_bib_meta(author: str, artist: Optional[str], publisher: Optional[str],
-                   isbn: Optional[str], pub_date: Optional[str]) -> tuple[str, str, str, str]:
-    """OPF metadata の書誌ブロックを組み立てる（yomikake v2.10.0 連携）。
-    戻り値 (creators_meta, publisher_meta, date_meta, source_meta)。
-    原作は role=aut、作画(artist)は role=art。yomikake が役割別に表示する。
+# ---------- ISBN normalization / auto-detection ----------
+#
+# dc:source urn:isbn is what yomikake turns into an NDL (国立国会図書館サーチ)
+# link, and NDL only matches on bare digits, so the value must be a clean
+# 13-digit ISBN-13 — no "ISBN" prefix, no hyphens (half or full width).
+# normalize_isbn() is the single gate for both the --isbn option and the
+# auto-detected value; detect_isbn_from_pdf() scrapes the colophon/back-cover
+# OCR text of the last pages when --isbn is omitted.
+
+# Separator allowed between ISBN digits: ASCII hyphen, unicode hyphens, any
+# whitespace. (Text is NFKC-normalized first, so full-width hyphen/space/digits
+# are already folded to their ASCII forms.)
+_ISBN_SEP = r'[-‐‑\s]?'
+# Bare EAN-13 ISBN (978/979 …). The digit-boundary lookarounds stop it from
+# matching the leading 13 digits of a longer run such as the 192… price
+# barcode printed below the ISBN barcode on manga back covers.
+_EAN13_RE = re.compile(r'(?<!\d)97[89](?:' + _ISBN_SEP + r'\d){10}(?!\d)')
+# ISBN-10 shaped token (exactly 10 digit-ish chars, last may be X).
+_ISBN10_RE = re.compile(r'(?:\d' + _ISBN_SEP + r'){9}[\dX]')
+_ISBN_KW_RE = re.compile(r'ISBN', re.I)
+
+
+def _isbn13_check_ok(s: str) -> bool:
+    if len(s) != 13 or not s.isdigit():
+        return False
+    total = sum((1 if i % 2 == 0 else 3) * int(d) for i, d in enumerate(s))
+    return total % 10 == 0
+
+
+def _isbn10_check_ok(s: str) -> bool:
+    if len(s) != 10:
+        return False
+    total = 0
+    for i, c in enumerate(s):
+        v = 10 if c == "X" else (int(c) if c.isdigit() else -1)
+        if v < 0:
+            return False
+        total += (10 - i) * v
+    return total % 11 == 0
+
+
+def _isbn10_to_13(s10: str) -> str:
+    core = "978" + s10[:9]
+    check = (10 - sum((1 if i % 2 == 0 else 3) * int(d)
+                      for i, d in enumerate(core)) % 10) % 10
+    return core + str(check)
+
+
+def normalize_isbn(raw: Optional[str]) -> Optional[str]:
+    """Return a bare 13-digit ISBN-13, or None if `raw` isn't a valid ISBN.
+
+    Strips an "ISBN" prefix, half/full-width hyphens, spaces and colons (via
+    NFKC), validates the check digit, and converts a valid ISBN-10 to ISBN-13.
+    A 13-digit value must start 978/979 (rejecting e.g. the 192… price
+    barcode). Idempotent on an already-clean ISBN-13 string.
     """
-    entries: list[tuple[str, str]] = []
-    if author:
-        entries.append((author, "aut"))
-    if artist:
-        entries.append((artist, "art"))
-    if not entries:
-        entries.append(("unknown", "aut"))
+    if not raw:
+        return None
+    s = unicodedata.normalize("NFKC", raw)
+    s = re.sub(r"^\s*ISBN\s*[:：]?\s*", "", s, flags=re.I)
+    s = re.sub(r"[^0-9Xx]", "", s).upper()
+    if _isbn13_check_ok(s) and s[:3] in ("978", "979"):
+        return s
+    if _isbn10_check_ok(s):
+        return _isbn10_to_13(s)
+    return None
+
+
+def detect_isbn_from_pdf(pdf_path: Path, max_pages: int = 10) -> Optional[str]:
+    """Best-effort ISBN-13 from the colophon / back-cover OCR text.
+
+    Scans the final `max_pages` pages' text layer (via pypdf) from the last
+    page backwards. A bare 978/979 EAN-13 is preferred (unambiguous, never
+    collides with the 192… price barcode); an ISBN-10 next to an "ISBN"
+    keyword is the fallback for older books whose colophon predates ISBN-13.
+    Every candidate passes through normalize_isbn(), so OCR noise and the
+    price barcode are rejected. Returns a bare 13-digit string or None.
+    """
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as e:
+        print(f"[isbn] auto-detect skipped ({e})", file=sys.stderr)
+        return None
+    n = len(reader.pages)
+    lo = max(0, n - max_pages)
+    texts: dict[int, str] = {}
+    for pi in range(n - 1, lo - 1, -1):
+        try:
+            raw = reader.pages[pi].extract_text() or ""
+        except Exception:
+            raw = ""
+        texts[pi] = unicodedata.normalize("NFKC", raw) if raw else ""
+
+    # Pass 1: bare EAN-13 (preferred), last page first.
+    for pi in range(n - 1, lo - 1, -1):
+        for m in _EAN13_RE.finditer(texts[pi]):
+            got = normalize_isbn(m.group(0))
+            if got:
+                print(f"[isbn] auto-detected {got} "
+                      f"(page {pi + 1}, EAN-13)", file=sys.stderr)
+                return got
+    # Pass 2: ISBN-10 adjacent to an "ISBN" keyword (older colophons).
+    for pi in range(n - 1, lo - 1, -1):
+        txt = texts[pi]
+        for kw in _ISBN_KW_RE.finditer(txt):
+            window = txt[kw.end():kw.end() + 25]
+            m = _ISBN10_RE.search(window)
+            if not m:
+                continue
+            got = normalize_isbn(m.group(0))
+            if got:
+                print(f"[isbn] auto-detected {got} "
+                      f"(page {pi + 1}, ISBN-10 colophon)", file=sys.stderr)
+                return got
+    print(f"[isbn] not found in last {min(max_pages, n)} page(s)",
+          file=sys.stderr)
+    return None
+
+
+# ---------- Publication date from the colophon (奥付) ----------
+#
+# The colophon prints the publication date as 西暦 (2005年11月11日), 和暦
+# (昭和57年1月19日 / 令和元年十月十二日), sometimes with kanji numerals. We take
+# the earliest date adjacent to a 発行 keyword — the first edition — and prefer a
+# date next to 初版/第1刷. OCR garble on the month/day degrades to YYYY-MM / YYYY
+# rather than emitting a wrong date. dc:date is the original publication date, so
+# a scan/conversion date is never substituted (that lives in dcterms:modified).
+
+_KANJI_DIGIT = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "元": 1}
+_ERA_BASE = {"昭和": 1925, "平成": 1988, "令和": 2018}
+_PD_NUM = r"[0-9〇零一二三四五六七八九十元]"
+_PUBDATE_RE = re.compile(
+    r"(?:(昭和|平成|令和)\s*(" + _PD_NUM + r"{1,2})|((?:19|20)\d{2}))\s*年"
+    r"\s*(" + _PD_NUM + r"{1,3})?\s*月\s*(" + _PD_NUM + r"{1,3})?\s*日?")
+_PUBDATE_FIRST_RE = re.compile(r"初版|第\s*1\s*刷|第\s*一\s*刷")
+
+
+def _kanji_num(s: Optional[str]) -> Optional[int]:
+    """Parse a small number written in ASCII or kanji numerals (0-99)."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        a, _, b = s.partition("十")
+        tens = (_KANJI_DIGIT.get(a, 1) if a else 1)
+        ones = (_KANJI_DIGIT.get(b, 0) if b else 0)
+        return tens * 10 + ones
+    v = 0
+    for c in s:
+        if c not in _KANJI_DIGIT:
+            return None
+        v = v * 10 + _KANJI_DIGIT[c]
+    return v
+
+
+def _pubdate_to_iso(m: "re.Match") -> Optional[str]:
+    era, ey, sy, mo, da = m.groups()
+    year = _ERA_BASE[era] + (_kanji_num(ey) or 0) if era else int(sy)
+    if not (1945 <= year <= 2035):
+        return None
+    mm = _kanji_num(mo)
+    dd = _kanji_num(da)
+    if mm and 1 <= mm <= 12:
+        if dd and 1 <= dd <= 31:
+            return f"{year:04d}-{mm:02d}-{dd:02d}"
+        return f"{year:04d}-{mm:02d}"
+    return f"{year:04d}"
+
+
+def detect_pubdate_from_pdf(pdf_path: Path, max_pages: int = 12) -> Optional[str]:
+    """Best-effort original publication date (ISO) from the colophon text.
+
+    Scans the last `max_pages` pages for dates adjacent to a 発行 keyword,
+    prefers the first-edition date (初版/第1刷, else the earliest), and returns
+    YYYY-MM-DD (or YYYY-MM / YYYY when the day/month is OCR-garbled). None when
+    no colophon date is found. Never returns a scan/conversion date.
+    """
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as e:
+        print(f"[date] auto-detect skipped ({e})", file=sys.stderr)
+        return None
+    n = len(reader.pages)
+    for pi in range(n - 1, max(-1, n - 1 - max_pages), -1):
+        try:
+            txt = reader.pages[pi].extract_text() or ""
+        except Exception:
+            continue
+        if not txt:
+            continue
+        txt = unicodedata.normalize("NFKC", txt)
+        if "発行" not in txt:
+            continue
+        cands: list[tuple[str, bool]] = []
+        for m in _PUBDATE_RE.finditer(txt):
+            if "発行" not in txt[m.start():m.end() + 20]:
+                continue
+            iso = _pubdate_to_iso(m)
+            if not iso:
+                continue
+            ctx = txt[max(0, m.start() - 8):m.end() + 20]
+            cands.append((iso, bool(_PUBDATE_FIRST_RE.search(ctx))))
+        if cands:
+            firsts = [c for c in cands if c[1]]
+            pool = firsts if firsts else cands
+            pool.sort(key=lambda c: c[0])
+            iso = pool[0][0]
+            print(f"[date] auto-detected {iso} (page {pi + 1}, 奥付)",
+                  file=sys.stderr)
+            return iso
+    print("[date] not found in colophon", file=sys.stderr)
+    return None
+
+
+# ---------- NDL (国立国会図書館サーチ) bibliographic lookup ----------
+#
+# With a detected/​given ISBN we query the NDL OpenSearch API for authoritative
+# bibliography — crucially the readings (file-as) and the statement of
+# responsibility (責任表示: natural-form name + role) that OCR/filenames can't
+# give us. Best-effort: any network/parse failure or a miss returns None and the
+# caller falls back to filename/OCR. Standard library only (urllib + ElementTree).
+
+_NDL_ENDPOINT = "https://ndlsearch.ndl.go.jp/api/opensearch"
+_NDL_NS = {"dc": "http://purl.org/dc/elements/1.1/",
+           "dcndl": "http://ndl.go.jp/dcndl/terms/",
+           "dcterms": "http://purl.org/dc/terms/"}
+_NDL_ROLE_BY_JP = {
+    "著": "aut", "作": "aut", "文": "aut", "原作": "aut", "原著": "aut",
+    "編": "edt", "編集": "edt", "編著": "edt", "監修": "edt",
+    "訳": "trl", "翻訳": "trl", "訳注": "trl",
+    "画": "art", "作画": "art", "漫画": "art",
+    "絵": "ill", "イラスト": "ill", "挿絵": "ill",
+}
+
+
+def _ndl_kana_title(s: Optional[str]) -> Optional[str]:
+    """Title transcription -> reading (just collapse comma/space)."""
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", s.replace(",", " ")).strip()
+    return s or None
+
+
+def _ndl_kana_name(s: Optional[str]) -> Optional[str]:
+    """Creator transcription '姓, 名, マンガカ, 1954-' -> 'セイ メイ'.
+
+    NDL appends occupation/birth-year segments after the 姓/名 reading; keep only
+    the first two non-numeric comma-segments so they don't leak into file-as.
+    """
+    if not s:
+        return None
+    segs = [seg.strip() for seg in s.split(",")]
+    segs = [seg for seg in segs if seg and not re.search(r"\d", seg)]
+    if not segs:
+        return None
+    return re.sub(r"\s+", " ", " ".join(segs[:2])).strip() or None
+
+
+def _ndl_name_key(s: Optional[str]) -> str:
+    """Normalize a personal name for matching (drop spaces, commas, birth year)."""
+    if not s:
+        return ""
+    s = re.sub(r",?\s*\d{4}\s*-\s*(?:\d{4})?\s*$", "", s.strip())  # trailing 生年
+    return re.sub(r"[\s,、]", "", s)
+
+
+def _ndl_parse_responsibility(text: str) -> list[tuple[str, str]]:
+    """'蒼樹うめ 著,相川愛三 訳' -> [('蒼樹うめ','aut'), ('相川愛三','trl')]."""
+    out: list[tuple[str, str]] = []
+    for part in re.split(r"[,、]", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        role = "aut"
+        mrole = re.search(r"[\s　]*([^\s　]{1,3})\s*$", part)
+        # try longest role word (2 chars) then 1 char
+        for w in (part[-2:], part[-1:]):
+            if w in _NDL_ROLE_BY_JP:
+                role = _NDL_ROLE_BY_JP[w]
+                part = part[:len(part) - len(w)].strip("　 ・")
+                break
+        if part:
+            out.append((part, role))
+    return out
+
+
+def fetch_ndl_by_isbn(isbn: str, timeout: float = 8.0) -> Optional[dict]:
+    """Fetch bibliography from NDL OpenSearch for `isbn` (bare 13-digit).
+
+    Returns a dict {title, title_kana, creators:[{name,role,kana}], publisher,
+    date, series, volume, ndc} from the first record, or None on any failure/miss.
+    """
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    url = f"{_NDL_ENDPOINT}?isbn={isbn}"
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent":
+                          f"manga_p2epub/{__version__} (+bibliographic lookup)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        root = ET.fromstring(raw)
+    except Exception as e:
+        print(f"[ndl] lookup skipped ({type(e).__name__})", file=sys.stderr)
+        return None
+
+    item = root.find("./channel/item")
+    if item is None:
+        print(f"[ndl] no record for isbn {isbn}", file=sys.stderr)
+        return None
+
+    def _t(el, path):
+        node = el.find(path, _NDL_NS)
+        return node.text.strip() if node is not None and node.text else None
+
+    title = _t(item, "dc:title")
+    title_kana = _ndl_kana_title(_t(item, "dcndl:titleTranscription"))
+    norm_names = [e.text.strip() for e in item.findall("dc:creator", _NDL_NS)
+                  if e.text]
+    # NDL supplies a transcription only for creators that have a Japanese
+    # reading; latin-name creators (e.g. "Sweigart, Al") get none. Keep the
+    # transcriptions as a queue and hand them out to Japanese-name creators in
+    # order so the reading lands on the right person.
+    kana_queue = [k for k in
+                  (_ndl_kana_name(e.text) for e in
+                   item.findall("dcndl:creatorTranscription", _NDL_NS) if e.text)
+                  if k]
+
+    # Statement of responsibility (natural form + role) from the description CDATA.
+    resp: list[tuple[str, str]] = []
+    desc = _t(item, "description") or ""
+    mresp = re.search(r"責任表示：(.*?)(?:</li>|</ul>|$)", desc)
+    if mresp:
+        resp = _ndl_parse_responsibility(mresp.group(1))
+
+    creators: list[dict] = []
+    count = max(len(resp), len(norm_names))
+    for i in range(count):
+        if i < len(resp):
+            name, role = resp[i]
+        elif i < len(norm_names):
+            name, role = _ndl_kana_title(norm_names[i]), "aut"
+        else:
+            continue
+        if not name:
+            continue
+        kana = None
+        if not re.search(r"[A-Za-z]", name) and kana_queue:
+            kana = kana_queue.pop(0)
+        creators.append({"name": name, "role": role, "kana": kana,
+                         "norm": norm_names[i] if i < len(norm_names) else name})
+
+    # publication date: dcterms:issued (YYYY.M) preferred, else dc:date (YYYY).
+    date = None
+    issued = _t(item, "dcterms:issued") or _t(item, "dc:date")
+    if issued:
+        md = re.match(r"(\d{4})(?:[.\-/](\d{1,2}))?", issued.strip())
+        if md:
+            date = f"{md.group(1)}-{int(md.group(2)):02d}" if md.group(2) else md.group(1)
+
+    # NDC subject (dc:subject with xsi:type ...NDC...).
+    ndc = None
+    for sub in item.findall("dc:subject", _NDL_NS):
+        typ = sub.get("{http://www.w3.org/2001/XMLSchema-instance}type") or ""
+        if "NDC" in typ and sub.text:
+            ndc = sub.text.strip()
+            break
+
+    rec = {
+        "title": title, "title_kana": title_kana, "creators": creators,
+        "publisher": _t(item, "dc:publisher"), "date": date,
+        "series": _t(item, "dcndl:seriesTitle"),
+        "volume": _t(item, "dcndl:volume"), "ndc": ndc,
+    }
+    who = " / ".join(f"{c['name']}({c['role']})" for c in creators) or "?"
+    print(f"[ndl] hit: title={title!r} creators=[{who}] date={date}",
+          file=sys.stderr)
+    return rec
+
+
+def _access_meta(has_text_layer: bool) -> str:
+    """Accessibility metadata (schema.org). A fixed-layout image comic is
+    accessMode=visual; when the invisible OCR text layer is present, textual is
+    added too. accessModeSufficient stays visual — the artwork is required to
+    read a comic; the OCR text only supplements search/selection."""
+    lines = ['<meta property="schema:accessMode">visual</meta>']
+    if has_text_layer:
+        lines.append('<meta property="schema:accessMode">textual</meta>')
+    lines.append('<meta property="schema:accessModeSufficient">visual</meta>')
+    lines.append('<meta property="schema:accessibilityFeature">none</meta>')
+    lines.append('<meta property="schema:accessibilityHazard">none</meta>')
+    summary = ("画像で構成された固定レイアウトのコミック。スキャナーOCRによる"
+               "透明テキスト層を含み、本文の検索・選択が可能。" if has_text_layer
+               else "画像で構成された固定レイアウトのコミック。本文テキスト層は含まない。")
+    lines.append(f'<meta property="schema:accessibilitySummary">{xml_escape(summary)}</meta>')
+    return "".join(line + "\n" for line in lines)
+
+
+def build_bib_meta(title: str, title_kana: Optional[str],
+                   creators: list[dict], publisher: Optional[str],
+                   publisher_kana: Optional[str], pub_date: Optional[str],
+                   isbn: Optional[str], description: Optional[str],
+                   series: Optional[str], volume: Optional[str],
+                   ndc: Optional[str], has_text_layer: bool) -> dict:
+    """Render the OPF <metadata> bibliographic pieces (yomikake 連携)。
+
+    `creators` is a resolved list of {name, role, kana}; role is a marc:relators
+    code (aut/art/trl/edt/ill). file-as (読み) is emitted for title/creator/
+    publisher when a reading is available. Returns a dict of rendered fragments
+    keyed for OPF_TMPL.format().
+    """
+    # title (+ file-as)
+    title_meta = f'<dc:title id="title">{xml_escape(title)}</dc:title>'
+    if title_kana:
+        title_meta += (f'\n<meta refines="#title" property="file-as">'
+                       f'{xml_escape(title_kana)}</meta>')
+
+    # creators (role + display-seq + optional file-as)
+    if not creators:
+        creators = [{"name": "unknown", "role": "aut", "kana": None}]
     clines: list[str] = []
-    for i, (name, role) in enumerate(entries, 1):
+    for i, c in enumerate(creators, 1):
         cid = f"creator{i:02d}"
-        clines.append(f'<dc:creator id="{cid}">{xml_escape(name)}</dc:creator>')
-        clines.append(f'<meta refines="#{cid}" property="role" scheme="marc:relators">{role}</meta>')
+        clines.append(f'<dc:creator id="{cid}">{xml_escape(c["name"])}</dc:creator>')
+        clines.append(f'<meta refines="#{cid}" property="role" '
+                      f'scheme="marc:relators">{c.get("role", "aut")}</meta>')
         clines.append(f'<meta refines="#{cid}" property="display-seq">{i}</meta>')
+        if c.get("kana"):
+            clines.append(f'<meta refines="#{cid}" property="file-as">'
+                          f'{xml_escape(c["kana"])}</meta>')
     creators_meta = "\n".join(clines)
-    publisher_meta = f'\n<dc:publisher>{xml_escape(publisher)}</dc:publisher>' if publisher else ""
+
+    # publisher (+ file-as)
+    if publisher:
+        publisher_meta = f'\n<dc:publisher id="publisher">{xml_escape(publisher)}</dc:publisher>'
+        if publisher_kana:
+            publisher_meta += (f'\n<meta refines="#publisher" property="file-as">'
+                               f'{xml_escape(publisher_kana)}</meta>')
+    else:
+        publisher_meta = ""
+
     date_meta = f'\n<dc:date>{xml_escape(pub_date)}</dc:date>' if pub_date else ""
-    _isbn = re.sub(r"[-\s]", "", isbn) if isbn else ""
+    _isbn = normalize_isbn(isbn)  # idempotent; caller normally passes a clean value
     source_meta = f'\n<dc:source>urn:isbn:{_isbn}</dc:source>' if _isbn else ""
-    return creators_meta, publisher_meta, date_meta, source_meta
+    description_meta = (f'\n<dc:description>{xml_escape(description)}</dc:description>'
+                        if description else "")
+    subject_meta = f'\n<dc:subject>NDC {xml_escape(ndc)}</dc:subject>' if ndc else ""
+    series_meta = ""
+    if series:
+        series_meta = f'\n<meta property="dcndl:seriesTitle">{xml_escape(series)}</meta>'
+        if volume:
+            series_meta += f'\n<meta property="dcndl:volume">{xml_escape(volume)}</meta>'
+
+    return {
+        "title_meta": title_meta, "creators_meta": creators_meta,
+        "publisher_meta": publisher_meta, "date_meta": date_meta,
+        "source_meta": source_meta, "description_meta": description_meta,
+        "subject_meta": subject_meta, "series_meta": series_meta,
+        "access_meta": _access_meta(has_text_layer),
+    }
 
 
 def sanitize_filename(name: str) -> str:
@@ -1085,6 +1530,72 @@ def xml_escape(s: str) -> str:
              .replace("'", "&apos;"))
 
 
+def _resolve_creators(author: str, artist: Optional[str],
+                      author_kana: Optional[str], artist_kana: Optional[str],
+                      author_is_cli: bool, creator_source: str,
+                      ndl: Optional[dict]) -> list[dict]:
+    """Resolve the dc:creator list as [{name, role, kana}, ...].
+
+    creator_source="filename" (default): the display names come from
+    --author/--artist/filename (keeping yomikake's bookKey stable and
+    network-independent); NDL only supplies the missing readings, matched by
+    name, and warns when the filename name diverges from NDL's form.
+    creator_source="ndl": adopt NDL's statement-of-responsibility names/roles/
+    readings when a record was found (--author/--artist still override), else
+    fall back to the filename behaviour.
+    """
+    ndl_creators = ndl["creators"] if ndl else []
+
+    if creator_source == "ndl" and ndl_creators:
+        creators = [{"name": c["name"], "role": c["role"], "kana": c["kana"]}
+                    for c in ndl_creators]
+        if author_is_cli and author:
+            for c in creators:
+                if c["role"] == "aut":
+                    c["name"] = author
+                    c["kana"] = author_kana or c["kana"]
+                    break
+            else:
+                creators.insert(0, {"name": author, "role": "aut",
+                                    "kana": author_kana})
+        if artist:
+            for c in creators:
+                if c["role"] == "art":
+                    c["name"] = artist
+                    c["kana"] = artist_kana or c["kana"]
+                    break
+            else:
+                creators.append({"name": artist, "role": "art",
+                                 "kana": artist_kana})
+        return creators
+
+    # filename mode (default)
+    creators = []
+    if author:
+        creators.append({"name": author, "role": "aut", "kana": author_kana})
+    if artist:
+        creators.append({"name": artist, "role": "art", "kana": artist_kana})
+    if not creators:
+        creators.append({"name": "unknown", "role": "aut", "kana": None})
+
+    if ndl_creators:
+        by_key: dict[str, dict] = {}
+        for c in ndl_creators:
+            by_key.setdefault(_ndl_name_key(c["name"]), c)
+            by_key.setdefault(_ndl_name_key(c.get("norm", "")), c)
+        by_key.pop("", None)
+        for c in creators:
+            match = by_key.get(_ndl_name_key(c["name"]))
+            if match:
+                if not c["kana"]:
+                    c["kana"] = match["kana"]
+            else:
+                ndl_names = " / ".join(x["name"] for x in ndl_creators)
+                print(f'[ndl] creator: ファイル名"{c["name"]}" が NDL"{ndl_names}" '
+                      f'と一致しません（表示名はファイル名を採用）', file=sys.stderr)
+    return creators
+
+
 # ---------- EPUB builder ----------
 
 def build_epub(pdf_path: Path,
@@ -1099,9 +1610,46 @@ def build_epub(pdf_path: Path,
                artist: Optional[str] = None,      # 作画 → dc:creator role=art
                publisher: Optional[str] = None,   # 原出版社 → dc:publisher
                isbn: Optional[str] = None,        # 底本 ISBN → dc:source urn:isbn
-               pub_date: Optional[str] = None) -> None:  # 原刊行日 → dc:date
+               pub_date: Optional[str] = None,    # 原刊行日 → dc:date
+               detect_isbn: bool = True,          # --isbn 未指定時に奥付から自動検出
+               author_is_cli: bool = False,       # --author 明示か（NDL上書き判定）
+               creator_source: str = "filename",  # dc:creator 本文の源: filename|ndl
+               use_ndl: bool = True,              # ISBN から NDL 書誌照会
+               detect_date: bool = True,          # 発行日を奥付から自動検出
+               description: Optional[str] = None, # あらすじ → dc:description（手動）
+               title_kana: Optional[str] = None,      # 書名の読み → file-as
+               author_kana: Optional[str] = None,     # 著者の読み → file-as
+               artist_kana: Optional[str] = None,     # 作画の読み → file-as
+               publisher_kana: Optional[str] = None,  # 出版社の読み → file-as
+               ) -> None:
     uid = str(uuid.uuid4())
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Resolve the ISBN: an explicit --isbn is normalized (and warned about if
+    # malformed); otherwise auto-detect from the last pages' colophon text.
+    resolved_isbn = normalize_isbn(isbn)
+    if isbn and resolved_isbn is None:
+        print(f"[isbn] ignoring invalid --isbn value: {isbn!r}", file=sys.stderr)
+    if resolved_isbn is None and detect_isbn:
+        resolved_isbn = detect_isbn_from_pdf(pdf_path)
+    isbn = resolved_isbn
+
+    # --- Resolve bibliographic metadata (precedence: CLI > NDL > filename/OCR).
+    #     Text values are gathered here; the OPF fragments are rendered later,
+    #     once the OCR text-layer presence (for accessMode) is known.
+    ndl = fetch_ndl_by_isbn(isbn) if (isbn and use_ndl) else None
+    r_creators = _resolve_creators(author, artist, author_kana, artist_kana,
+                                   author_is_cli, creator_source, ndl)
+    r_title_kana = title_kana or (ndl["title_kana"] if ndl else None)
+    r_publisher = publisher or (ndl["publisher"] if ndl else None)
+    r_pub_kana = publisher_kana  # NDL provides no publisher reading
+    # date: --date (manual) > NDL issued > OCR colophon detection
+    r_pub_date = pub_date or (ndl["date"] if ndl else None)
+    if not r_pub_date and detect_date:
+        r_pub_date = detect_pubdate_from_pdf(pdf_path)
+    r_series = ndl["series"] if ndl else None
+    r_volume = ndl["volume"] if ndl else None
+    r_ndc = ndl["ndc"] if ndl else None
 
     rotate_ctx = _setup_auto_rotate(pdf_path) if auto_rotate else None
     crop_box = _setup_auto_crop(pdf_path) if auto_crop else None
@@ -1266,14 +1814,11 @@ def build_epub(pdf_path: Path,
             f'<itemref idref="{page_id}" linear="yes" properties="{spread}"/>'
         )
 
-    creators_meta, publisher_meta, date_meta, source_meta = build_bib_meta(
-        author, artist, publisher, isbn, pub_date)
+    bib = build_bib_meta(
+        title, r_title_kana, r_creators, r_publisher, r_pub_kana, r_pub_date,
+        isbn, description, r_series, r_volume, r_ndc,
+        has_text_layer=bool(text_pages))
     opf_xml = OPF_TMPL.format(
-        title=xml_escape(title),
-        creators_meta=creators_meta,
-        publisher_meta=publisher_meta,
-        date_meta=date_meta,
-        source_meta=source_meta,
         uid=uid,
         modified=modified,
         vw=VIEWPORT_W,
@@ -1282,6 +1827,7 @@ def build_epub(pdf_path: Path,
         page_items="\n".join(page_items_lines),
         spine_items="\n".join(spine_lines),
         direction=direction,
+        **bib,
     )
 
     # 4. Compose nav + ncx (3 TOC entries: 表紙 / 本編 / 奥付).
@@ -1370,6 +1916,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Convert a scanned-book PDF into a fixed-layout manga EPUB3."
     )
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}")
     ap.add_argument("pdf", type=Path, help="input PDF (each page = one scan image)")
     ap.add_argument("-o", "--output", type=Path, default=None,
                     help="output EPUB path (default: <title>_<author>.epub next to input)")
@@ -1382,9 +1930,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--publisher", default=None,
                     help="原出版社 -> dc:publisher (shown as the publisher in the yomikake viewer)")
     ap.add_argument("--isbn", default=None,
-                    help="底本の ISBN -> dc:source urn:isbn (hyphens allowed; used for bibliographic search)")
+                    help="底本の ISBN -> dc:source urn:isbn (an 'ISBN' prefix, "
+                         "hyphens and ISBN-10 are accepted and normalized to a "
+                         "bare 13-digit ISBN-13; used for bibliographic search). "
+                         "If omitted, the ISBN is auto-detected from the "
+                         "colophon/back-cover text of the last pages")
+    ap.add_argument("--no-isbn-detect", action="store_true",
+                    help="disable ISBN auto-detection from the last pages "
+                         "(only used when --isbn is not given)")
     ap.add_argument("--date", default=None,
-                    help="原刊行日 -> dc:date (e.g. 2016-03-03)")
+                    help="原刊行日 -> dc:date (e.g. 2016-03-03). If omitted, taken "
+                         "from NDL, else auto-detected from the colophon (奥付)")
+    ap.add_argument("--no-ndl", action="store_true",
+                    help="disable NDL (国立国会図書館サーチ) bibliographic lookup "
+                         "(default: enabled when an ISBN is known — fills readings, "
+                         "publisher, date, series; fails silently offline)")
+    ap.add_argument("--creator-source", choices=("filename", "ndl"),
+                    default="filename",
+                    help="source of the dc:creator display name: 'filename' "
+                         "(default; --author/--artist/filename, keeps the yomikake "
+                         "bookmark key stable) or 'ndl' (adopt NDL's catalog form). "
+                         "NDL always supplies the readings/roles regardless")
+    ap.add_argument("--no-date-detect", action="store_true",
+                    help="disable publication-date auto-detection from the colophon "
+                         "(only used when --date is not given and NDL has no date)")
+    ap.add_argument("--description", default=None,
+                    help="あらすじ/内容紹介 -> dc:description (manual; not auto-detected)")
+    ap.add_argument("--title-kana", default=None,
+                    help="書名の読み -> title file-as (overrides NDL)")
+    ap.add_argument("--author-kana", default=None,
+                    help="著者の読み -> creator file-as (overrides NDL)")
+    ap.add_argument("--artist-kana", default=None,
+                    help="作画の読み -> creator file-as (overrides NDL)")
+    ap.add_argument("--publisher-kana", default=None,
+                    help="出版社の読み -> publisher file-as")
     ap.add_argument("--direction", choices=("rtl", "ltr"), default="rtl",
                     help="page progression (default: rtl)")
     ap.add_argument("--quality", type=int, default=JPEG_QUALITY,
@@ -1397,7 +1976,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-auto-crop", action="store_true",
                     help="disable auto-cropping of page margins "
                          "(default: enabled — uniform fractional crop is "
-                         "applied when all 4 sides have detected margin ≥ 3%; "
+                         "applied when all 4 sides have detected margin >= 3 percent; "
                          "manga and bleed pages are skipped automatically)")
     ap.add_argument("--no-text", action="store_true",
                     help="disable the invisible OCR text layer "
@@ -1442,7 +2021,15 @@ def main(argv: list[str] | None = None) -> int:
                    auto_crop=not args.no_auto_crop,
                    embed_text=not args.no_text,
                    artist=args.artist, publisher=args.publisher,
-                   isbn=args.isbn, pub_date=args.date)
+                   isbn=args.isbn, pub_date=args.date,
+                   detect_isbn=not args.no_isbn_detect,
+                   author_is_cli=bool(args.author),
+                   creator_source=args.creator_source,
+                   use_ndl=not args.no_ndl,
+                   detect_date=not args.no_date_detect,
+                   description=args.description,
+                   title_kana=args.title_kana, author_kana=args.author_kana,
+                   artist_kana=args.artist_kana, publisher_kana=args.publisher_kana)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
