@@ -1,6 +1,6 @@
 # mangaP2ePub
 
-スキャン済み PDF（紙の本を裁断してドキュメントスキャナで取り込んだ、1 ページ 1 画像の PDF）を、**固定レイアウト（漫画）ePub3** に変換する CLI ツールです。
+スキャン済み PDF（紙の本を裁断してドキュメントスキャナで取り込んだ、1 ページ 1 画像の PDF）を、**固定レイアウト（漫画）ePub3** および **CBZ（コミックブックアーカイブ）** に変換する CLI ツールです。
 
 出力は [EBPAJ 1.1.2](https://github.com/ebpaj/ebpaj-epub3-specs) のコミック仕様に準拠した pre-paginated EPUB3 で、ビューポートは 1103×1600 固定、右綴じ（`page-progression-direction="rtl"`）がデフォルトです。
 
@@ -8,7 +8,7 @@
 
 ## 特徴
 
-- **PDF から埋め込み JPEG を無劣化で抽出**（1 ページ 1 画像前提）
+- **PDF から埋め込み JPEG を無劣化で抽出**（1 ページ 1 画像前提。CCITT G4 / JBIG2 の 2 値ページは 1bit のまま可逆に持ち回り）
 - 全ページを **1103×1600 にフィット**（アスペクト比維持・白レターボックス）
 - cover（表紙）は `page-spread-center`、本文は rtl で奇数=right / 偶数=left に自動割り付け
 - TOC は最小 3 項目（**表紙 / 本編 / 奥付**）を `navigation-documents.xhtml` と `toc.ncx` の両方に出力
@@ -17,6 +17,7 @@
 - **ScanSnap 等の誤判定で混入した横長ページを自動で 90° 回転**（既定 ON、表紙・見開き等の本物の横長ページは保持）
 - **モノクロ漫画ページを自動でグレースケール化**（色相分析で「紙焼け・セピア地色」と「本物のカラーページ」を判別。表紙は常にカラー維持、冒頭カラーページ・淡色カラー扉も保護）+ JPEG 品質 78 既定で**容量約 25-35% 削減**
 - **小説スキャンの上下左右余白を自動クロップ**（既定 ON、漫画は自動スキップ、日焼けセピア紙にも適応）— 同じ viewport 内でテキストが約 20-40% 拡大
+- **CBZ 出力にも対応**（`--format cbz` / `both`）— 同じページ処理（自動回転・自動クロップ・カラー判定）を通したページを連番画像として ZIP 化し、`ComicInfo.xml` に書誌メタデータを同梱
 - **スキャナー OCR のテキスト層を ePub に埋め込み**（既定 ON、要 pdfminer.six）— PDF 内の透明テキストを文字単位の座標付きで抽出し、各ページの SVG に透明 `<text>` として重ねるため、**全文検索・位置どおりのテキスト選択・コピペ**が可能（Google Play Books / Thorium / calibre で動作確認。Send to Kindle は変換時にテキスト層が失われる）。トーン誤認識などの OCR ゴミ行は自動除去
 
 ---
@@ -47,6 +48,13 @@ python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf
 - `長い長いさんぽ` を題名、`須藤真澄` を作者として抽出
 - 同じディレクトリに `長い長いさんぽ_須藤真澄.epub` を生成
 
+### CBZ でも出力する
+
+```bash
+python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf --format both
+# → 長い長いさんぽ_須藤真澄.epub と 長い長いさんぽ_須藤真澄.cbz
+```
+
 ### オプションで上書き
 
 ```bash
@@ -62,7 +70,8 @@ python3 manga_p2epub.py scan.pdf \
 | オプション | 既定値 | 説明 |
 |---|---|---|
 | `pdf` (位置引数) | — | 入力 PDF（必須） |
-| `-o`, `--output` | `<title>_<author>.epub` | 出力 EPUB パス |
+| `-o`, `--output` | `<title>_<author>.<ext>` | 出力パス。`--format both` のときは共通ベース名として扱い、拡張子を `.epub` / `.cbz` に置換 |
+| `--format` | `epub` | 出力形式：`epub` / `cbz` / `both` |
 | `--title` | ファイル名から抽出 | 題名を明示指定（ファイル名優先解決を上書き） |
 | `--author` | ファイル名から抽出 | 作者（原作）を明示指定。`dc:creator` role=aut |
 | `--artist` | なし | 作画（絵）。2人目の `dc:creator` を role=art で追加。原作と作画が別の作品向け |
@@ -79,11 +88,64 @@ python3 manga_p2epub.py scan.pdf \
 | `--artist-kana` | NDL から自動 | 作画の読み → creator の `file-as`（同上） |
 | `--publisher-kana` | なし | 出版社の読み → publisher の `file-as` |
 | `--direction` | `rtl` | ページ送り方向（`rtl` または `ltr`） |
-| `--quality` | `78` | JPEG 品質（1–95）。上げれば高品質・大容量、下げれば軽量化 |
+| `--quality` | `78` | EPUB の JPEG 品質（1–95）。上げれば高品質・大容量、下げれば軽量化 |
+| `--cbz-quality` | `88` | CBZ の JPEG 品質（1–95）。CBZ はスキャン解像度のまま保存するため既定値を高めに設定 |
+| `--cbz-size` | `full` | CBZ のページサイズ：`full`（クロップ後の元解像度）または `viewport`（EPUB と同じ 1103×1600 にレターボックス） |
+| `--no-comicinfo` | オフ | CBZ に `ComicInfo.xml` を同梱しない |
 | `--no-auto-rotate` | オフ | 横長ページの自動回転を無効化（既定では有効） |
 | `--no-auto-crop` | オフ | 余白の自動クロップを無効化（既定では有効） |
 | `--no-text` | オフ | OCR テキスト層の埋め込みを無効化（既定では有効） |
 | `--force` | オフ | 出力先が存在しても上書き |
+
+---
+
+## CBZ 出力（`--format cbz` / `both`）
+
+[CBZ](https://en.wikipedia.org/wiki/Comic_book_archive) は、ページ画像に連番を付けて ZIP でまとめただけの単純なコミック形式です（[仕様の概要](https://docs.fileformat.com/ja/ebook/cbz/)）。本ツールの CBZ 出力は EPUB とまったく同じページ処理パイプライン（PDF 抽出 → 誤スキャン横長ページの自動回転 → 余白の自動クロップ → 書籍単位のカラー/グレー判定）を通した上で、書き出し方だけを変えます。
+
+```bash
+# CBZ のみ
+python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf --format cbz
+# EPUB と CBZ を一度に（ページ処理は 1 回だけ実行）
+python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf --format both
+```
+
+### アーカイブの構造
+
+```
+長い長いさんぽ_須藤真澄.cbz
+├── ComicInfo.xml   … 書誌メタデータ（--no-comicinfo で省略可）
+├── 0001.png        … 表紙から順に 4 桁ゼロ埋めの連番
+├── 0002.png
+└── …
+```
+
+- ファイル名の単純な昇順ソートが読み順になります（先頭が表紙）
+- 画像は既定でクロップ後の**元解像度**のまま格納（`--cbz-size viewport` で EPUB と同じ 1103×1600 に縮小）
+- **2 値（白黒 1bit）スキャンのページは可逆の 1bit PNG** で格納します。ドキュメントスキャナの本文ページは CCITT G4 / JBIG2 の 2 値画像であることが多く、JPEG 化すると線画にリンギングが乗った上に容量が 10 倍近くに膨らむためです。それ以外（表紙・カラー扉・グレースケール）は `--cbz-quality` の JPEG
+- ZIP エントリは STORED（無圧縮）— JPEG/PNG は既に圧縮済みのため
+
+### ComicInfo.xml
+
+CBZ には OPF に相当する書誌の置き場がないため、事実上の標準である ComicRack の `ComicInfo.xml` をアーカイブ直下に同梱します（Komga / Kavita / YACReader / ComicRack 系ビューアが参照）。EPUB 側と同じ解決結果（ファイル名・`--author` 等の指定・ISBN 自動検出・NDL 照会）から次の要素を出力します。
+
+| 要素 | 内容 |
+|---|---|
+| `Title` / `Series` / `Number` | 題名 / 題名（Komga 等の書架のグルーピングキー） / 巻次（NDL） |
+| `Summary` | `--description` |
+| `Notes` | 生成ツール名とバージョン、ISBN |
+| `Year` / `Month` / `Day` | 発行日（`--date` / NDL / 奥付自動検出） |
+| `Writer` / `Penciller` / `Translator` / `Editor` | 役割（marc:relators の aut/art・ill/trl/edt）で振り分けた著者名 |
+| `Publisher` / `Imprint` | 出版社 / レーベル（NDL の叢書名。「Bamboo comics」等） |
+| `PageCount` / `LanguageISO` | ページ数 / `ja` |
+| `BlackAndWhite` | 全ページがグレー判定なら `Yes` |
+| `Manga` | `--direction rtl` なら `YesAndRightToLeft`（右綴じ） |
+| `GTIN` | ISBN-13 |
+
+### EPUB との違い
+
+- OCR テキスト層は埋め込みません（CBZ に置き場がないため）。`--format cbz` 単独指定時は OCR 抽出処理自体をスキップします
+- 見開き配置（`page-spread-left/right`）や TOC は CBZ 形式に存在しないため出力しません
 
 ---
 
@@ -266,7 +328,8 @@ ScanSnap などのドキュメントスキャナは、縦組み本のページ�
 
 - すべて **1103×1600** にアスペクト比維持でフィット
 - 余白は白（RGB は `(255,255,255)`、グレースケールは `255`）で埋める
-- モードは `L`（グレースケール）か `RGB`。それ以外（CMYK, P など）は `RGB` に変換
+- モードは `L`（グレースケール）か `RGB`、および 2 値スキャンの `1`（1bit）。それ以外（CMYK, P など）は `RGB` に変換
+- **2 値（1bit）ページは可逆のまま処理**：クロップまで `1` mode で持ち回り、EPUB 用に縮小する直前で `L` に変換します（従来は抽出時に JPEG 化していたため二重劣化していました）。CBZ ではそのまま 1bit PNG として格納
 - **RGB 画像のうちモノクロ印刷ページは自動的に L mode に変換**（後述）
 - JPEG 品質 78 既定（`--quality` で変更可）、`optimize=True`
 - 既に 1103×1600 の画像もエンコーダ挙動を揃えるため再エンコードします
@@ -333,6 +396,18 @@ $ python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf
 [done] /path/to/長い長いさんぽ_須藤真澄.epub (48.7 MB)
 ```
 
+CBZ も同時に出力する場合（ページ処理は 1 回だけ走ります）：
+
+```
+$ python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf --format both
+…
+[info] writing /path/to/長い長いさんぽ_須藤真澄.epub
+[info] writing /path/to/長い長いさんぽ_須藤真澄.cbz
+[cbz] 120 page(s), full size, ComicInfo.xml
+[done] /path/to/長い長いさんぽ_須藤真澄.epub (48.7 MB)
+[done] /path/to/長い長いさんぽ_須藤真澄.cbz (25.2 MB)
+```
+
 ---
 
 ## スコープと制限（v0.2）
@@ -348,6 +423,7 @@ $ python3 manga_p2epub.py 長い長いさんぽ_須藤真澄.pdf
 ## ロードマップ
 
 - [ ] 元画像が viewport と同サイズなら再エンコードせず無劣化パススルー
+- [ ] CBZ でカラー/グレースケールページも元 JPEG を無劣化パススルー（クロップ・回転が不要なページ）
 - [ ] `--toc` オプションで任意の目次を読み込み
 - [ ] `--cover-image` で表紙を差し替え
 - [ ] `epubcheck` 連携（`--validate`）

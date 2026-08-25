@@ -5,6 +5,9 @@ manga_p2epub.py — Convert a scanned-book PDF into a fixed-layout (manga) EPUB3
 Input:  one PDF per book, each page holds a single embedded scan image.
 Output: EBPAJ 1.1.2 style pre-paginated EPUB with 1103x1600 viewport.
 
+v1.1.0 — optional CBZ (comic book archive) output: the same page pipeline
+(auto-rotate / auto-crop / color detection) written as sequentially numbered
+JPEGs in a ZIP, with a ComicInfo.xml metadata sidecar.
 v1.0.0 — invisible OCR text layer (search / select / copy), ISBN normalization
 and colophon auto-detection, NDL (国立国会図書館サーチ) bibliographic enrichment
 (readings / roles / date / publisher / series), publication-date detection, and
@@ -36,7 +39,7 @@ try:
 except ImportError:
     HAS_PDFMINER = False
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 # ---------- Constants ----------
@@ -44,6 +47,12 @@ __version__ = "1.0.0"
 VIEWPORT_W = 1103
 VIEWPORT_H = 1600
 JPEG_QUALITY = 78
+PNG_COMPRESS_LEVEL = 6            # bilevel CBZ pages (optimize=True would buy
+                                  # ~10% size for ~8x the encode time)
+PNG_COMPRESS_LEVEL_FAST = 1       # intermediate blobs that are decoded again
+CBZ_QUALITY = 88                  # CBZ pages keep their full scan resolution, so
+                                  # they are re-encoded a notch above the EPUB
+                                  # viewport copies to limit generation loss
 GRAYSCALE_DOWNSCALE_LONG_SIDE = 400
 
 # Color-vs-grayscale classification (see _is_effectively_grayscale)
@@ -720,9 +729,10 @@ def sanitize_filename(name: str) -> str:
     return _FS_BAD.sub("_", name).strip()
 
 
-def default_output_path(pdf_path: Path, title: str, author: Optional[str]) -> Path:
+def default_output_path(pdf_path: Path, title: str, author: Optional[str],
+                        ext: str = ".epub") -> Path:
     base = f"{title}_{author}" if author else title
-    return pdf_path.with_name(sanitize_filename(base) + ".epub")
+    return pdf_path.with_name(sanitize_filename(base) + ext)
 
 
 # ---------- Auto-rotate (misscanned landscape page → portrait) ----------
@@ -955,17 +965,17 @@ def _maybe_rotate_page(raw_bytes: bytes, idx: int, ctx: dict,
 
     rot, label = _decide_rotation(im, ctx["convention"])
     rotated = im.transpose(rot)
-    if rotated.mode not in ("L", "RGB"):
+    if rotated.mode not in ("L", "RGB", "1"):
         rotated = rotated.convert("RGB")
-    buf = BytesIO()
-    rotated.save(buf, "JPEG", quality=quality, optimize=True)
+    blob, _ext = _encode_page_blob(rotated, quality,
+                                   png_level=PNG_COMPRESS_LEVEL_FAST)
     print(
         f"[auto-rotate] page {idx + 1}: {w}x{h} -> "
         f"{rotated.width}x{rotated.height} ({label})",
         file=sys.stderr,
     )
     ctx["rotated"].add(idx)
-    return buf.getvalue()
+    return blob
 
 
 # ---------- Auto-crop (uniform fractional margin trim, default ON) ----------
@@ -1285,6 +1295,27 @@ def _encode_jpeg(im: Image.Image, quality: int = JPEG_QUALITY) -> bytes:
     return buf.getvalue()
 
 
+def _encode_page_blob(im: Image.Image,
+                      quality: int = JPEG_QUALITY,
+                      png_level: int = PNG_COMPRESS_LEVEL) -> tuple[bytes, str]:
+    """Encode a page image; returns (bytes, "png"|"jpeg").
+
+    Bilevel pages (mode "1" — the CCITT G4 / JBIG2 body pages a document
+    scanner produces) are stored as 1-bit PNG: lossless, typically an order
+    of magnitude smaller than the equivalent JPEG, and free of the ringing
+    JPEG adds to line art. Everything else is JPEG.
+
+    png_level is zlib's compression level; pass PNG_COMPRESS_LEVEL_FAST for
+    blobs that only travel between pipeline stages (they get decoded again
+    right away, so their size on disk never matters).
+    """
+    if im.mode == "1":
+        buf = BytesIO()
+        im.save(buf, "PNG", compress_level=png_level)
+        return buf.getvalue(), "png"
+    return _encode_jpeg(im, quality), "jpeg"
+
+
 def extract_page_images(pdf_path: Path):
     """
     Yield (page_index, raw_bytes, ext_hint) for every PDF page.
@@ -1295,7 +1326,9 @@ def extract_page_images(pdf_path: Path):
     - If /Rotate is 90/180/270 (set by a PDF editor to fix orientation),
       apply that rotation to the extracted image so the EPUB matches what
       a PDF reader would display.
-    - Otherwise rasterize the page via Pillow through pypdf's decoded image.
+    - Otherwise rasterize the page via Pillow through pypdf's decoded image;
+      bilevel (CCITT G4 / JBIG2) scans are re-encoded as lossless 1-bit PNG,
+      anything else as JPEG.
     """
     reader = PdfReader(str(pdf_path))
     for i, page in enumerate(reader.pages):
@@ -1312,7 +1345,8 @@ def extract_page_images(pdf_path: Path):
                 im = _apply_pdf_rotation(im, rot)
                 print(f"[pdf-rotate] page {i + 1}: applied /Rotate={rot}",
                       file=sys.stderr)
-            yield i, _encode_jpeg(im), "jpeg"
+            blob, ext = _encode_page_blob(im, png_level=PNG_COMPRESS_LEVEL_FAST)
+            yield i, blob, ext
             continue
         # 0 or >=2 images on a page — fall back to a rasterized PIL render.
         # pypdf can't rasterize vector content; as a v0.1 compromise, we
@@ -1325,7 +1359,8 @@ def extract_page_images(pdf_path: Path):
                 im = _apply_pdf_rotation(im, rot)
                 print(f"[pdf-rotate] page {i + 1}: applied /Rotate={rot}",
                       file=sys.stderr)
-            yield i, _encode_jpeg(im), "jpeg"
+            blob, ext = _encode_page_blob(im, png_level=PNG_COMPRESS_LEVEL_FAST)
+            yield i, blob, ext
         else:
             raise RuntimeError(
                 f"page {i + 1} contains no extractable image; "
@@ -1399,28 +1434,27 @@ def _is_effectively_grayscale(im: Image.Image) -> bool:
             and sat_mean <= TAN_SAT_MEAN_MAX)
 
 
-def normalize_to_viewport(img_bytes: bytes,
-                          target_w: int = VIEWPORT_W,
-                          target_h: int = VIEWPORT_H,
-                          quality: int = JPEG_QUALITY,
-                          crop_box: Optional[tuple[float, float, float, float]] = None,
-                          crop_stats: Optional[dict] = None,
-                          is_gray: Optional[bool] = None
-                          ) -> tuple[bytes, tuple[int, int, int, int, float, int, int]]:
-    """Fit-resize into target_w x target_h, letterboxing with white.
+def _prepare_page_image(img_bytes: bytes,
+                        crop_box: Optional[tuple[float, float, float, float]] = None,
+                        crop_stats: Optional[dict] = None,
+                        is_gray: Optional[bool] = None
+                        ) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Decode a page image, auto-crop it, and flatten near-monochrome pages.
 
-    Returns (jpeg_bytes, xform) where xform = (img_w, img_h, crop_l, crop_t,
-    scale, ox, oy) describes how a pixel of the decoded source image landed
-    on the viewport: img_w/img_h are the pre-crop dimensions, crop_l/crop_t
-    the crop origin in source pixels, scale the resize ratio, ox/oy the
-    letterbox offset. _svg_text_layer() uses this to map OCR coordinates.
+    This is the part of the pipeline shared by every output format: the EPUB
+    writer then fits the result into the fixed viewport (_fit_viewport), while
+    the CBZ writer keeps it at its scan resolution.
+
+    Returns (im, src_dims) where src_dims = (src_w, src_h, crop_l, crop_t)
+    records the pre-crop dimensions and the crop origin in source pixels;
+    _fit_viewport() needs them to map OCR coordinates onto the viewport.
 
     RGB images that are essentially monochrome (B&W manga interiors, even
     with sepia paper tone) are auto-converted to L mode for smaller files
     with no perceptible quality loss.
 
     is_gray: pass the page's precomputed color class to override the
-    per-image detection (build_epub decides book-wide: cover forced to
+    per-image detection (convert_pdf decides book-wide: cover forced to
     color, sandwich rule). None = detect here.
 
     crop_box: optional (T, B, L, R) fractional margins (0..1) to strip from
@@ -1449,8 +1483,11 @@ def normalize_to_viewport(img_bytes: bytes,
     edge-content pages.
     """
     im = Image.open(BytesIO(img_bytes))
-    if im.mode not in ("L", "RGB"):
+    if im.mode not in ("L", "RGB", "1"):
         im = im.convert("RGB")
+    # Mode "1" (CCITT/JBIG2 bilevel scans) is carried through as-is: the crop
+    # and the margin detection work on it unchanged, the CBZ writer can store
+    # it losslessly as PNG, and _fit_viewport() greyscales it before resizing.
     src_w, src_h = im.size
     crop_l = crop_t = 0
 
@@ -1502,6 +1539,26 @@ def normalize_to_viewport(img_bytes: bytes,
             crop_l, crop_t = left_px, top_px
     if im.mode == "RGB" and is_gray:
         im = im.convert("L")
+    return im, (src_w, src_h, crop_l, crop_t)
+
+
+def _fit_viewport(im: Image.Image,
+                  src_dims: tuple[int, int, int, int],
+                  target_w: int = VIEWPORT_W,
+                  target_h: int = VIEWPORT_H,
+                  quality: int = JPEG_QUALITY
+                  ) -> tuple[bytes, tuple[int, int, int, int, float, int, int]]:
+    """Fit-resize a prepared page into target_w x target_h, letterboxing white.
+
+    Returns (jpeg_bytes, xform) where xform = (img_w, img_h, crop_l, crop_t,
+    scale, ox, oy) describes how a pixel of the decoded source image landed
+    on the viewport: img_w/img_h are the pre-crop dimensions, crop_l/crop_t
+    the crop origin in source pixels, scale the resize ratio, ox/oy the
+    letterbox offset. _svg_text_layer() uses this to map OCR coordinates.
+    """
+    src_w, src_h, crop_l, crop_t = src_dims
+    if im.mode == "1":
+        im = im.convert("L")  # LANCZOS needs a continuous-tone mode
     if (im.width, im.height) == (target_w, target_h):
         # Already correct size — re-emit with consistent encoder settings so
         # readers don't trip over unusual JPEG variants.
@@ -1518,6 +1575,20 @@ def normalize_to_viewport(img_bytes: bytes,
     buf = BytesIO()
     canvas.save(buf, "JPEG", quality=quality, optimize=True)
     return buf.getvalue(), (src_w, src_h, crop_l, crop_t, ratio, ox, oy)
+
+
+def normalize_to_viewport(img_bytes: bytes,
+                          target_w: int = VIEWPORT_W,
+                          target_h: int = VIEWPORT_H,
+                          quality: int = JPEG_QUALITY,
+                          crop_box: Optional[tuple[float, float, float, float]] = None,
+                          crop_stats: Optional[dict] = None,
+                          is_gray: Optional[bool] = None
+                          ) -> tuple[bytes, tuple[int, int, int, int, float, int, int]]:
+    """Prepare a page image and fit it into the viewport (one-shot helper)."""
+    im, src_dims = _prepare_page_image(img_bytes, crop_box=crop_box,
+                                       crop_stats=crop_stats, is_gray=is_gray)
+    return _fit_viewport(im, src_dims, target_w, target_h, quality)
 
 
 # ---------- XML helpers ----------
@@ -1596,32 +1667,145 @@ def _resolve_creators(author: str, artist: Optional[str],
     return creators
 
 
+# ---------- CBZ (comic book archive) builder ----------
+#
+# A CBZ is just a ZIP of page images named so that a plain filename sort gives
+# the reading order (https://en.wikipedia.org/wiki/Comic_book_archive).
+# Readers additionally pick up the de-facto ComicRack "ComicInfo.xml" sidecar
+# at the archive root, which is where the bibliographic metadata goes — a CBZ
+# has no OPF, so this is the only place a title/author/ISBN can live.
+
+# marc:relators role -> ComicInfo element (kept in schema order below)
+COMICINFO_ROLE_MAP = {
+    "aut": "Writer",
+    "art": "Penciller",
+    "ill": "Penciller",
+    "trl": "Translator",
+    "edt": "Editor",
+}
+
+
+def build_comicinfo(title: str, creators: list[dict], publisher: Optional[str],
+                    pub_date: Optional[str], isbn: Optional[str],
+                    description: Optional[str], imprint: Optional[str],
+                    volume: Optional[str], direction: str, page_count: int,
+                    black_and_white: bool) -> str:
+    """Render ComicInfo.xml for the archive root.
+
+    Element order follows the ComicInfo v2.0 schema sequence; GTIN (v2.1) is
+    emitted last so v2.0-era readers simply ignore it. The ISBN is repeated in
+    <Notes> for readers that only surface free text.
+
+    <Series> is the library grouping key in Komga/Kavita/YACReader, so it gets
+    the book title. NDL's 叢書名 is a publisher label for manga ("Bamboo
+    comics", "KC デラックス"), which belongs in <Imprint> — using it as the
+    series would collapse every book from that label into one shelf.
+    """
+    by_role: dict[str, list[str]] = {}
+    for c in creators:
+        el = COMICINFO_ROLE_MAP.get(c.get("role", "aut"), "Writer")
+        by_role.setdefault(el, []).append(c["name"])
+
+    year = month = day = None
+    if pub_date:
+        m = re.match(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$", pub_date)
+        if m:
+            year, month, day = m.group(1), m.group(2), m.group(3)
+
+    notes = [f"Generated by manga_p2epub.py {__version__}"]
+    if isbn:
+        notes.append(f"ISBN {isbn}")
+
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<ComicInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+             'xmlns:xsd="http://www.w3.org/2001/XMLSchema">']
+
+    def add(tag: str, value: Optional[str]) -> None:
+        if value:
+            lines.append(f"  <{tag}>{xml_escape(str(value))}</{tag}>")
+
+    add("Title", title)
+    add("Series", title)
+    add("Number", volume)
+    add("Summary", description)
+    add("Notes", "; ".join(notes))
+    add("Year", year)
+    add("Month", str(int(month)) if month else None)
+    add("Day", str(int(day)) if day else None)
+    for el in ("Writer", "Penciller", "Translator", "Editor"):
+        add(el, ", ".join(by_role[el]) if el in by_role else None)
+    add("Publisher", publisher)
+    add("Imprint", imprint)
+    add("PageCount", str(page_count))
+    add("LanguageISO", "ja")
+    add("BlackAndWhite", "Yes" if black_and_white else "No")
+    # rtl (Japanese manga) vs a left-to-right release
+    add("Manga", "YesAndRightToLeft" if direction == "rtl" else "Yes")
+    add("GTIN", isbn)
+    lines.append("</ComicInfo>")
+    return "\n".join(lines) + "\n"
+
+
+def _encode_cbz_page(im: Image.Image, quality: int) -> tuple[bytes, str]:
+    """Encode one prepared page for a CBZ; returns (bytes, file suffix)."""
+    blob, ext = _encode_page_blob(im, quality)
+    return blob, ".png" if ext == "png" else ".jpg"
+
+
+def write_cbz(out_path: Path, pages: list[tuple[str, bytes]],
+              comicinfo: Optional[str] = None) -> None:
+    """Write the page blobs (already in reading order) as a CBZ archive."""
+    with zipfile.ZipFile(out_path, "w") as z:
+        if comicinfo:
+            z.writestr("ComicInfo.xml", comicinfo,
+                       compress_type=zipfile.ZIP_DEFLATED)
+        for name, blob in pages:
+            # JPEG/PNG payloads are already compressed — STORED keeps them as-is.
+            z.writestr(name, blob, compress_type=zipfile.ZIP_STORED)
+
+
 # ---------- EPUB builder ----------
 
-def build_epub(pdf_path: Path,
-               out_path: Path,
-               title: str,
-               author: str,
-               direction: str = "rtl",
-               quality: int = JPEG_QUALITY,
-               auto_rotate: bool = True,
-               auto_crop: bool = True,
-               embed_text: bool = True,
-               artist: Optional[str] = None,      # 作画 → dc:creator role=art
-               publisher: Optional[str] = None,   # 原出版社 → dc:publisher
-               isbn: Optional[str] = None,        # 底本 ISBN → dc:source urn:isbn
-               pub_date: Optional[str] = None,    # 原刊行日 → dc:date
-               detect_isbn: bool = True,          # --isbn 未指定時に奥付から自動検出
-               author_is_cli: bool = False,       # --author 明示か（NDL上書き判定）
-               creator_source: str = "filename",  # dc:creator 本文の源: filename|ndl
-               use_ndl: bool = True,              # ISBN から NDL 書誌照会
-               detect_date: bool = True,          # 発行日を奥付から自動検出
-               description: Optional[str] = None, # あらすじ → dc:description（手動）
-               title_kana: Optional[str] = None,      # 書名の読み → file-as
-               author_kana: Optional[str] = None,     # 著者の読み → file-as
-               artist_kana: Optional[str] = None,     # 作画の読み → file-as
-               publisher_kana: Optional[str] = None,  # 出版社の読み → file-as
-               ) -> None:
+def convert_pdf(pdf_path: Path,
+                title: str,
+                author: str,
+                epub_path: Optional[Path] = None,  # None = don't write an EPUB
+                cbz_path: Optional[Path] = None,   # None = don't write a CBZ
+                direction: str = "rtl",
+                quality: int = JPEG_QUALITY,
+                cbz_quality: int = CBZ_QUALITY,    # CBZ の JPEG 品質
+                cbz_size: str = "full",            # full=元解像度 / viewport=EPUB と同寸
+                comicinfo: bool = True,            # CBZ に ComicInfo.xml を同梱
+                auto_rotate: bool = True,
+                auto_crop: bool = True,
+                embed_text: bool = True,
+                artist: Optional[str] = None,      # 作画 → dc:creator role=art
+                publisher: Optional[str] = None,   # 原出版社 → dc:publisher
+                isbn: Optional[str] = None,        # 底本 ISBN → dc:source urn:isbn
+                pub_date: Optional[str] = None,    # 原刊行日 → dc:date
+                detect_isbn: bool = True,          # --isbn 未指定時に奥付から自動検出
+                author_is_cli: bool = False,       # --author 明示か（NDL上書き判定）
+                creator_source: str = "filename",  # dc:creator 本文の源: filename|ndl
+                use_ndl: bool = True,              # ISBN から NDL 書誌照会
+                detect_date: bool = True,          # 発行日を奥付から自動検出
+                description: Optional[str] = None, # あらすじ → dc:description（手動）
+                title_kana: Optional[str] = None,      # 書名の読み → file-as
+                author_kana: Optional[str] = None,     # 著者の読み → file-as
+                artist_kana: Optional[str] = None,     # 作画の読み → file-as
+                publisher_kana: Optional[str] = None,  # 出版社の読み → file-as
+                ) -> None:
+    """Convert one scanned PDF into an EPUB and/or a CBZ.
+
+    Both formats share the whole page pipeline (extraction, auto-rotate,
+    auto-crop, book-wide color classification) and the resolved bibliographic
+    metadata; they differ only in the final render: the EPUB letterboxes every
+    page into the fixed 1103x1600 viewport and carries the OCR text layer,
+    while the CBZ stores the pages at their scan resolution (cbz_size="full").
+    """
+    if epub_path is None and cbz_path is None:
+        raise ValueError("no output requested (need epub_path and/or cbz_path)")
+    want_epub = epub_path is not None
+    want_cbz = cbz_path is not None
     uid = str(uuid.uuid4())
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1655,7 +1839,7 @@ def build_epub(pdf_path: Path,
     crop_box = _setup_auto_crop(pdf_path) if auto_crop else None
 
     text_pages: dict[int, dict] = {}
-    if embed_text:
+    if embed_text and want_epub:  # the CBZ has nowhere to put a text layer
         if HAS_PDFMINER:
             print("[text-layer] extracting OCR text", file=sys.stderr)
             try:
@@ -1678,7 +1862,8 @@ def build_epub(pdf_path: Path,
         if crop_box is not None else None
     )
 
-    # 1a. Extract (and possibly rotate) every page, keeping raw JPEG bytes.
+    # 1a. Extract (and possibly rotate) every page, keeping the encoded
+    #     page bytes (JPEG, or PNG for bilevel scans).
     print(f"[info] extracting pages from {pdf_path.name}", file=sys.stderr)
     raw_pages: list[bytes] = []
     for i, raw, _ext in extract_page_images(pdf_path):
@@ -1740,26 +1925,43 @@ def build_epub(pdf_path: Path,
     print(f"[color-detect] {n_color}/{len(gray_flags)} page(s) kept in color"
           + (f" ({'; '.join(notes)})" if notes else ""), file=sys.stderr)
 
-    # 2. Normalize every page into the viewport.
+    # 2. Render every page: crop/grayscale once, then emit each requested
+    #    format from that same decoded image (the EPUB copy is letterboxed
+    #    into the viewport, the CBZ copy keeps the scan resolution).
     print("[info] normalizing pages", file=sys.stderr)
+    fit_needed = want_epub or cbz_size == "viewport"
     page_blobs: list[tuple[str, str, bytes]] = []
     # each entry: (image_id, image_filename, jpeg_bytes)
     xforms: list[tuple[int, int, int, int, float, int, int]] = []
+    cbz_pages: list[tuple[str, bytes]] = []   # (archive filename, jpeg_bytes)
     for i, raw in enumerate(raw_pages):
-        jpg, xform = normalize_to_viewport(raw, VIEWPORT_W, VIEWPORT_H, quality,
-                                           crop_box=crop_box, crop_stats=crop_stats,
+        im, src_dims = _prepare_page_image(raw, crop_box=crop_box,
+                                           crop_stats=crop_stats,
                                            is_gray=gray_flags[i])
-        xforms.append(xform)
+        jpg = b""
+        if fit_needed:
+            jpg, xform = _fit_viewport(im, src_dims, VIEWPORT_W, VIEWPORT_H,
+                                       quality)
+            xforms.append(xform)
         raw_pages[i] = b""  # free the raw page as we go
-        if i == 0:
-            image_id = "cover"
-            image_name = "cover.jpg"
-        else:
-            image_id = f"i-{i:03d}"
-            image_name = f"i-{i:03d}.jpg"
-        page_blobs.append((image_id, image_name, jpg))
+        if want_epub:
+            if i == 0:
+                image_id = "cover"
+                image_name = "cover.jpg"
+            else:
+                image_id = f"i-{i:03d}"
+                image_name = f"i-{i:03d}.jpg"
+            page_blobs.append((image_id, image_name, jpg))
+        if want_cbz:
+            if cbz_size == "viewport":
+                blob, ext = jpg, ".jpg"
+            else:
+                blob, ext = _encode_cbz_page(im, cbz_quality)
+            # zero-padded so a plain filename sort is the reading order
+            cbz_pages.append((f"{i + 1:04d}{ext}", blob))
         if (i + 1) % 20 == 0 or i == 0:
-            print(f"  page {i + 1} ... {len(jpg) / 1024:.1f} KB", file=sys.stderr)
+            shown = jpg if want_epub else cbz_pages[-1][1]
+            print(f"  page {i + 1} ... {len(shown) / 1024:.1f} KB", file=sys.stderr)
 
     if crop_stats is not None:
         print(
@@ -1776,151 +1978,173 @@ def build_epub(pdf_path: Path,
                 file=sys.stderr,
             )
 
-    total = len(page_blobs)
+    total = len(raw_pages)
     if total == 0:
         raise RuntimeError("no pages extracted from PDF")
 
     last_body_idx = total - 1
 
-    # 3. Compose OPF parts.
-    image_items_lines = []
-    page_items_lines = []
-    spine_lines = []
+    # 3-6. Compose and write the EPUB.
+    if want_epub:
+        # 3. Compose OPF parts.
+        image_items_lines = []
+        page_items_lines = []
+        spine_lines = []
 
-    for idx, (image_id, image_name, _blob) in enumerate(page_blobs):
-        if idx == 0:
-            item_props = ' properties="cover-image"'
-            page_id = "p-cover"
-            spread = "rendition:page-spread-center"
-        else:
-            item_props = ""
-            page_id = f"p-{idx:03d}"
-            # rtl: odd body page → right, even → left
-            if direction == "rtl":
-                spread = "page-spread-right" if (idx % 2 == 1) else "page-spread-left"
+        for idx, (image_id, image_name, _blob) in enumerate(page_blobs):
+            if idx == 0:
+                item_props = ' properties="cover-image"'
+                page_id = "p-cover"
+                spread = "rendition:page-spread-center"
             else:
-                spread = "page-spread-left" if (idx % 2 == 1) else "page-spread-right"
+                item_props = ""
+                page_id = f"p-{idx:03d}"
+                # rtl: odd body page → right, even → left
+                if direction == "rtl":
+                    spread = "page-spread-right" if (idx % 2 == 1) else "page-spread-left"
+                else:
+                    spread = "page-spread-left" if (idx % 2 == 1) else "page-spread-right"
 
-        image_items_lines.append(
-            f'<item id="{image_id}" href="image/{image_name}" '
-            f'media-type="image/jpeg"{item_props}/>'
+            image_items_lines.append(
+                f'<item id="{image_id}" href="image/{image_name}" '
+                f'media-type="image/jpeg"{item_props}/>'
+            )
+            page_items_lines.append(
+                f'<item id="{page_id}" href="xhtml/{page_id}.xhtml" '
+                f'media-type="application/xhtml+xml" properties="svg" '
+                f'fallback="{image_id}"/>'
+            )
+            spine_lines.append(
+                f'<itemref idref="{page_id}" linear="yes" properties="{spread}"/>'
+            )
+
+        bib = build_bib_meta(
+            title, r_title_kana, r_creators, r_publisher, r_pub_kana, r_pub_date,
+            isbn, description, r_series, r_volume, r_ndc,
+            has_text_layer=bool(text_pages))
+        opf_xml = OPF_TMPL.format(
+            uid=uid,
+            modified=modified,
+            vw=VIEWPORT_W,
+            vh=VIEWPORT_H,
+            image_items="\n".join(image_items_lines),
+            page_items="\n".join(page_items_lines),
+            spine_items="\n".join(spine_lines),
+            direction=direction,
+            **bib,
         )
-        page_items_lines.append(
-            f'<item id="{page_id}" href="xhtml/{page_id}.xhtml" '
-            f'media-type="application/xhtml+xml" properties="svg" '
-            f'fallback="{image_id}"/>'
+
+        # 4. Compose nav + ncx (3 TOC entries: 表紙 / 本編 / 奥付).
+        if total >= 3:
+            toc = [
+                ("表紙", "xhtml/p-cover.xhtml"),
+                ("本編", "xhtml/p-001.xhtml"),
+                ("奥付", f"xhtml/p-{last_body_idx:03d}.xhtml"),
+            ]
+        elif total == 2:
+            toc = [
+                ("表紙", "xhtml/p-cover.xhtml"),
+                ("本編", "xhtml/p-001.xhtml"),
+            ]
+        else:
+            toc = [("表紙", "xhtml/p-cover.xhtml")]
+
+        nav_items = "\n".join(
+            f'<li><a href="{href}">{xml_escape(label)}</a></li>' for label, href in toc
         )
-        spine_lines.append(
-            f'<itemref idref="{page_id}" linear="yes" properties="{spread}"/>'
+        nav_xml = NAV_XHTML_TMPL.format(toc_items=nav_items)
+
+        nav_points = "\n".join(
+            f'<navPoint id="navPoint-{i + 1}" playOrder="{i + 1}">'
+            f'<navLabel><text>{xml_escape(label)}</text></navLabel>'
+            f'<content src="{href}"/></navPoint>'
+            for i, (label, href) in enumerate(toc)
         )
+        ncx_xml = NCX_TMPL.format(uid=f"urn:uuid:{uid}", title=xml_escape(title),
+                                  nav_points=nav_points)
 
-    bib = build_bib_meta(
-        title, r_title_kana, r_creators, r_publisher, r_pub_kana, r_pub_date,
-        isbn, description, r_series, r_volume, r_ndc,
-        has_text_layer=bool(text_pages))
-    opf_xml = OPF_TMPL.format(
-        uid=uid,
-        modified=modified,
-        vw=VIEWPORT_W,
-        vh=VIEWPORT_H,
-        image_items="\n".join(image_items_lines),
-        page_items="\n".join(page_items_lines),
-        spine_items="\n".join(spine_lines),
-        direction=direction,
-        **bib,
-    )
+        # 5. Compose per-page XHTML (with the invisible OCR text layer when the
+        #    page kept its original orientation).
+        rotated_pages = pdf_rotated | (rotate_ctx["rotated"] if rotate_ctx else set())
+        text_page_count = 0
+        page_xhtmls: list[tuple[str, str]] = []
+        for idx, (_image_id, image_name, _blob) in enumerate(page_blobs):
+            page_id = "p-cover" if idx == 0 else f"p-{idx:03d}"
+            text_layer = ""
+            if text_pages and idx not in rotated_pages:
+                text_layer = _svg_text_layer(text_pages.get(idx), xforms[idx])
+                if text_layer:
+                    text_page_count += 1
+            xhtml = PAGE_XHTML_TMPL.format(
+                title=xml_escape(title),
+                vw=VIEWPORT_W, vh=VIEWPORT_H,
+                image_name=image_name,
+                text_layer=text_layer,
+            )
+            page_xhtmls.append((page_id, xhtml))
+        if text_pages:
+            print(f"[text-layer] embedded on {text_page_count}/{total} page(s)",
+                  file=sys.stderr)
 
-    # 4. Compose nav + ncx (3 TOC entries: 表紙 / 本編 / 奥付).
-    if total >= 3:
-        toc = [
-            ("表紙", "xhtml/p-cover.xhtml"),
-            ("本編", "xhtml/p-001.xhtml"),
-            ("奥付", f"xhtml/p-{last_body_idx:03d}.xhtml"),
-        ]
-    elif total == 2:
-        toc = [
-            ("表紙", "xhtml/p-cover.xhtml"),
-            ("本編", "xhtml/p-001.xhtml"),
-        ]
-    else:
-        toc = [("表紙", "xhtml/p-cover.xhtml")]
+        # 6. Write the ZIP (mimetype STORED first, everything else DEFLATED).
+        print(f"[info] writing {epub_path}", file=sys.stderr)
+        with zipfile.ZipFile(epub_path, "w") as z:
+            zi = zipfile.ZipInfo("mimetype")
+            zi.compress_type = zipfile.ZIP_STORED
+            z.writestr(zi, MIMETYPE)
 
-    nav_items = "\n".join(
-        f'<li><a href="{href}">{xml_escape(label)}</a></li>' for label, href in toc
-    )
-    nav_xml = NAV_XHTML_TMPL.format(toc_items=nav_items)
-
-    nav_points = "\n".join(
-        f'<navPoint id="navPoint-{i + 1}" playOrder="{i + 1}">'
-        f'<navLabel><text>{xml_escape(label)}</text></navLabel>'
-        f'<content src="{href}"/></navPoint>'
-        for i, (label, href) in enumerate(toc)
-    )
-    ncx_xml = NCX_TMPL.format(uid=f"urn:uuid:{uid}", title=xml_escape(title),
-                              nav_points=nav_points)
-
-    # 5. Compose per-page XHTML (with the invisible OCR text layer when the
-    #    page kept its original orientation).
-    rotated_pages = pdf_rotated | (rotate_ctx["rotated"] if rotate_ctx else set())
-    text_page_count = 0
-    page_xhtmls: list[tuple[str, str]] = []
-    for idx, (_image_id, image_name, _blob) in enumerate(page_blobs):
-        page_id = "p-cover" if idx == 0 else f"p-{idx:03d}"
-        text_layer = ""
-        if text_pages and idx not in rotated_pages:
-            text_layer = _svg_text_layer(text_pages.get(idx), xforms[idx])
-            if text_layer:
-                text_page_count += 1
-        xhtml = PAGE_XHTML_TMPL.format(
-            title=xml_escape(title),
-            vw=VIEWPORT_W, vh=VIEWPORT_H,
-            image_name=image_name,
-            text_layer=text_layer,
-        )
-        page_xhtmls.append((page_id, xhtml))
-    if text_pages:
-        print(f"[text-layer] embedded on {text_page_count}/{total} page(s)",
-              file=sys.stderr)
-
-    # 6. Write the ZIP (mimetype STORED first, everything else DEFLATED).
-    print(f"[info] writing {out_path}", file=sys.stderr)
-    with zipfile.ZipFile(out_path, "w") as z:
-        zi = zipfile.ZipInfo("mimetype")
-        zi.compress_type = zipfile.ZIP_STORED
-        z.writestr(zi, MIMETYPE)
-
-        z.writestr("META-INF/container.xml", CONTAINER_XML,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("item/standard.opf", opf_xml,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("item/navigation-documents.xhtml", nav_xml,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("item/toc.ncx", ncx_xml,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("item/style/fixed-layout-jp.css", FIXED_LAYOUT_CSS,
-                   compress_type=zipfile.ZIP_DEFLATED)
-
-        for page_id, xhtml in page_xhtmls:
-            z.writestr(f"item/xhtml/{page_id}.xhtml", xhtml,
+            z.writestr("META-INF/container.xml", CONTAINER_XML,
+                       compress_type=zipfile.ZIP_DEFLATED)
+            z.writestr("item/standard.opf", opf_xml,
+                       compress_type=zipfile.ZIP_DEFLATED)
+            z.writestr("item/navigation-documents.xhtml", nav_xml,
+                       compress_type=zipfile.ZIP_DEFLATED)
+            z.writestr("item/toc.ncx", ncx_xml,
+                       compress_type=zipfile.ZIP_DEFLATED)
+            z.writestr("item/style/fixed-layout-jp.css", FIXED_LAYOUT_CSS,
                        compress_type=zipfile.ZIP_DEFLATED)
 
-        for _image_id, image_name, blob in page_blobs:
-            # JPEGs are already compressed — STORED keeps them as-is.
-            z.writestr(f"item/image/{image_name}", blob,
-                       compress_type=zipfile.ZIP_STORED)
+            for page_id, xhtml in page_xhtmls:
+                z.writestr(f"item/xhtml/{page_id}.xhtml", xhtml,
+                           compress_type=zipfile.ZIP_DEFLATED)
+
+            for _image_id, image_name, blob in page_blobs:
+                # JPEGs are already compressed — STORED keeps them as-is.
+                z.writestr(f"item/image/{image_name}", blob,
+                           compress_type=zipfile.ZIP_STORED)
+    # 7. Write the CBZ (page images + ComicInfo.xml sidecar).
+    if want_cbz:
+        print(f"[info] writing {cbz_path}", file=sys.stderr)
+        info_xml = None
+        if comicinfo:
+            info_xml = build_comicinfo(
+                title, r_creators, r_publisher, r_pub_date, isbn, description,
+                imprint=r_series, volume=r_volume, direction=direction,
+                page_count=total, black_and_white=all(gray_flags))
+        write_cbz(cbz_path, cbz_pages, info_xml)
+        print(f"[cbz] {total} page(s), {cbz_size} size"
+              + (", ComicInfo.xml" if info_xml else ""), file=sys.stderr)
+
 
 
 # ---------- CLI ----------
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Convert a scanned-book PDF into a fixed-layout manga EPUB3."
+        description="Convert a scanned-book PDF into a fixed-layout manga EPUB3 "
+                    "and/or a CBZ comic book archive."
     )
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
     ap.add_argument("pdf", type=Path, help="input PDF (each page = one scan image)")
     ap.add_argument("-o", "--output", type=Path, default=None,
-                    help="output EPUB path (default: <title>_<author>.epub next to input)")
+                    help="output path (default: <title>_<author>.<ext> next to "
+                         "input). With --format both this is used as the common "
+                         "base name, its suffix replaced by .epub / .cbz")
+    ap.add_argument("--format", choices=("epub", "cbz", "both"), default="epub",
+                    help="output format(s) (default: epub). 'cbz' writes a comic "
+                         "book archive: the same processed pages as sequentially "
+                         "numbered JPEGs in a ZIP, plus a ComicInfo.xml sidecar")
     ap.add_argument("--title", default=None,
                     help="override title (default: parsed from filename)")
     ap.add_argument("--author", default=None,
@@ -1967,8 +2191,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--direction", choices=("rtl", "ltr"), default="rtl",
                     help="page progression (default: rtl)")
     ap.add_argument("--quality", type=int, default=JPEG_QUALITY,
-                    help=f"JPEG quality 1-95 (default: {JPEG_QUALITY}; "
+                    help=f"EPUB JPEG quality 1-95 (default: {JPEG_QUALITY}; "
                          f"raise for higher fidelity at the cost of file size)")
+    ap.add_argument("--cbz-quality", type=int, default=CBZ_QUALITY,
+                    help=f"CBZ JPEG quality 1-95 (default: {CBZ_QUALITY}; higher "
+                         f"than --quality because CBZ pages keep their full scan "
+                         f"resolution)")
+    ap.add_argument("--cbz-size", choices=("full", "viewport"), default="full",
+                    help="CBZ page size: 'full' (default) keeps the scan "
+                         "resolution after cropping; 'viewport' letterboxes every "
+                         f"page into {VIEWPORT_W}x{VIEWPORT_H} like the EPUB")
+    ap.add_argument("--no-comicinfo", action="store_true",
+                    help="do not write the ComicInfo.xml metadata sidecar "
+                         "into the CBZ")
     ap.add_argument("--no-auto-rotate", action="store_true",
                     help="disable auto-rotation of misscanned landscape pages "
                          "(default: enabled — landscape pages whose dimensions "
@@ -1985,7 +2220,7 @@ def main(argv: list[str] | None = None) -> int:
                          "searchable and text can be selected/copied; "
                          "requires pdfminer.six)")
     ap.add_argument("--force", action="store_true",
-                    help="overwrite existing output file")
+                    help="overwrite existing output file(s)")
     args = ap.parse_args(argv)
 
     pdf_path: Path = args.pdf
@@ -2008,34 +2243,53 @@ def main(argv: list[str] | None = None) -> int:
     if args.artist:
         print(f"[info] artist=\"{args.artist}\" (作画)", file=sys.stderr)
 
-    out_path: Path = args.output or default_output_path(pdf_path, title, author if args.author or parsed_author else None)
-    if out_path.exists() and not args.force:
-        print(f"[error] output already exists: {out_path} (use --force)", file=sys.stderr)
-        return 2
-    print(f"[info] output -> {out_path}", file=sys.stderr)
+    known_author = author if (args.author or parsed_author) else None
+    outputs: dict[str, Path] = {}
+    for fmt, ext in (("epub", ".epub"), ("cbz", ".cbz")):
+        if args.format not in (fmt, "both"):
+            continue
+        if args.output is None:
+            outputs[fmt] = default_output_path(pdf_path, title, known_author, ext)
+        elif args.format == "both":
+            # one --output for two files: treat it as the shared base name
+            outputs[fmt] = args.output.with_suffix(ext)
+        else:
+            outputs[fmt] = args.output  # single format: honour the path verbatim
+
+    for out_path in outputs.values():
+        if out_path.exists() and not args.force:
+            print(f"[error] output already exists: {out_path} (use --force)",
+                  file=sys.stderr)
+            return 2
+    print("[info] output -> " + ", ".join(str(v) for v in outputs.values()),
+          file=sys.stderr)
 
     try:
-        build_epub(pdf_path, out_path, title, author,
-                   direction=args.direction, quality=args.quality,
-                   auto_rotate=not args.no_auto_rotate,
-                   auto_crop=not args.no_auto_crop,
-                   embed_text=not args.no_text,
-                   artist=args.artist, publisher=args.publisher,
-                   isbn=args.isbn, pub_date=args.date,
-                   detect_isbn=not args.no_isbn_detect,
-                   author_is_cli=bool(args.author),
-                   creator_source=args.creator_source,
-                   use_ndl=not args.no_ndl,
-                   detect_date=not args.no_date_detect,
-                   description=args.description,
-                   title_kana=args.title_kana, author_kana=args.author_kana,
-                   artist_kana=args.artist_kana, publisher_kana=args.publisher_kana)
+        convert_pdf(pdf_path, title, author,
+                    epub_path=outputs.get("epub"), cbz_path=outputs.get("cbz"),
+                    direction=args.direction, quality=args.quality,
+                    cbz_quality=args.cbz_quality, cbz_size=args.cbz_size,
+                    comicinfo=not args.no_comicinfo,
+                    auto_rotate=not args.no_auto_rotate,
+                    auto_crop=not args.no_auto_crop,
+                    embed_text=not args.no_text,
+                    artist=args.artist, publisher=args.publisher,
+                    isbn=args.isbn, pub_date=args.date,
+                    detect_isbn=not args.no_isbn_detect,
+                    author_is_cli=bool(args.author),
+                    creator_source=args.creator_source,
+                    use_ndl=not args.no_ndl,
+                    detect_date=not args.no_date_detect,
+                    description=args.description,
+                    title_kana=args.title_kana, author_kana=args.author_kana,
+                    artist_kana=args.artist_kana, publisher_kana=args.publisher_kana)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
 
-    print(f"[done] {out_path} ({out_path.stat().st_size / 1024 / 1024:.1f} MB)",
-          file=sys.stderr)
+    for out_path in outputs.values():
+        print(f"[done] {out_path} "
+              f"({out_path.stat().st_size / 1024 / 1024:.1f} MB)", file=sys.stderr)
     return 0
 
 
